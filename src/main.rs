@@ -151,7 +151,7 @@ fn main() {
     }
 }
 
-const LOG_LOCATION: &str = "./dev.log";
+const LOG_LOCATION: &str = "./dev";
 
 fn log(message: &String) {
     let log_message = format!("{}: {}\n", chrono::Local::now(), message);
@@ -212,17 +212,16 @@ fn wrap(text: &String, width: usize) -> Vec<String> {
     lines
 }
 
-#[derive(PartialEq, Clone)]
+#[derive(PartialEq, Clone, Debug)]
 enum InputMode {
     Edit,
     Command,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct State {
     messages: Vec<openai::Message>,
     input: Vec<String>,
-    input_line: u16,
     input_mode: InputMode,
     paging_index: u16,
     // these 2 are (x, y) coordinates
@@ -232,19 +231,9 @@ struct State {
 }
 
 impl State {
-    fn clone(&self) -> State {
-        State {
-            messages: self.messages.clone(),
-            input: self.input.clone(),
-            input_line: self.input_line,
-            input_mode: self.input_mode.clone(),
-            paging_index: self.paging_index,
-            input_cursor_position: self.input_cursor_position,
-            highlight_cursor_position: self.highlight_cursor_position,
-        }
-    }
-
     // changing origin from terminal window to input box
+    //
+    // this _DOES NOT_ adjust for paging
     fn get_input_position(&self) -> (u16, u16) {
         let origin = input_origin();
         (
@@ -252,14 +241,11 @@ impl State {
             self.input_cursor_position.1 - origin.1,
         )
     }
-}
 
-fn return_cursor() {
-    execute!(std::io::stdout(), crossterm::cursor::MoveToColumn(0)).unwrap();
-}
-
-fn clear_line() {
-    execute!(std::io::stdout(), Clear(ClearType::CurrentLine)).unwrap();
+    fn get_current_line(&self) -> String {
+        let row = self.get_input_position().1;
+        self.input[(self.paging_index + row) as usize].clone()
+    }
 }
 
 fn display() {
@@ -270,12 +256,11 @@ fn display() {
 
     let mut init = true;
 
-    let (width, height) = crossterm::terminal::size().unwrap();
+    let height = crossterm::terminal::size().unwrap().1;
 
     let mut state = State {
         messages: Vec::new(),
         input: Vec::from([String::new()]),
-        input_line: 0,
         input_mode: InputMode::Command,
         paging_index: 0,
         input_cursor_position: (PROMPT.len() as u16, height - CHAT_BOX_HEIGHT),
@@ -340,7 +325,9 @@ fn display() {
                 draw(
                     &state_queue,
                     state.messages.len() != state_queue.messages.len() || init,
-                    state.input != state_queue.input || init,
+                    state.input != state_queue.input
+                        || init
+                        || state.paging_index != state_queue.paging_index,
                 );
 
                 state = state_queue.clone();
@@ -397,21 +384,14 @@ fn draw(state: &State, redraw_messages: bool, redraw_input: bool) {
 
     if redraw_input {
         execute!(std::io::stdout(), Clear(ClearType::CurrentLine)).unwrap();
-        // lmfao
-        // is this a joke
-        //
-        // we only want to take lines that will fit in the input box,
-        // starting from the end
-        let lines = if state.input.len() > CHAT_BOX_HEIGHT as usize {
-            &state.input[state.input.len() - CHAT_BOX_HEIGHT as usize..]
+        let h = CHAT_BOX_HEIGHT as usize;
+        let paging_index = state.paging_index as usize;
+        let lines = if state.input.len() > h {
+            &state.input[paging_index..std::cmp::min(paging_index + h, state.input.len())]
         } else {
             &state.input
         };
 
-        // right now, with how displayed_input is set,
-        // current_row will always be within the bounds of the input box
-        //
-        // this should probably be changed in the future
         for line in lines.iter() {
             execute!(std::io::stdout(), Clear(ClearType::CurrentLine)).unwrap();
             let display_line = if line.ends_with('\n') {
@@ -419,7 +399,6 @@ fn draw(state: &State, redraw_messages: bool, redraw_input: bool) {
             } else {
                 line.clone()
             };
-
             print!("{}", display_line);
             current_row += 1;
             move_cursor((PROMPT.len() as u16, current_row));
@@ -433,10 +412,6 @@ fn draw(state: &State, redraw_messages: bool, redraw_input: bool) {
         cursor_to_block();
         move_cursor(state.highlight_cursor_position);
     }
-}
-
-fn input_width() -> u16 {
-    crossterm::terminal::size().unwrap().0 - 1 - PROMPT.len() as u16
 }
 
 fn input_origin() -> (u16, u16) {
@@ -454,24 +429,28 @@ fn move_cursor(position: (u16, u16)) {
     .unwrap();
 }
 
+fn clamp_input_position(state: &mut State) {
+    let col = state.get_input_position().0;
+    let current_line = state.get_current_line();
+    if col >= current_line.len() as u16 {
+        state.input_cursor_position.0 = current_line.len() as u16 + PROMPT.len() as u16;
+    }
+}
+
 fn left(state: &mut State) {
     if state.input_mode == InputMode::Edit {
         if state.input_cursor_position.0 > PROMPT.len() as u16 {
             state.input_cursor_position.0 -= 1;
             move_cursor(state.input_cursor_position);
         }
-    } else {
-        if state.highlight_cursor_position.0 > 0 {
-            state.highlight_cursor_position.0 -= 1;
-            move_cursor(state.highlight_cursor_position);
-        }
     }
 }
 
 fn right(state: &mut State) {
     if state.input_mode == InputMode::Edit {
-        let (col, row) = state.get_input_position();
-        if col < state.input[row as usize].len() as u16 {
+        let col = state.get_input_position().0;
+        let current_line = state.get_current_line();
+        if col < current_line.len() as u16 {
             state.input_cursor_position.0 += 1;
             move_cursor(state.input_cursor_position);
         }
@@ -480,9 +459,12 @@ fn right(state: &mut State) {
 
 fn up(state: &mut State) {
     if state.input_mode == InputMode::Edit {
-        if state.input_cursor_position.1 > crossterm::terminal::size().unwrap().1 - CHAT_BOX_HEIGHT
-        {
+        let row = state.get_input_position().1;
+        if row == 0 && state.paging_index > 0 {
+            state.paging_index -= 1;
+        } else if row > 0 {
             state.input_cursor_position.1 -= 1;
+            clamp_input_position(state);
             move_cursor(state.input_cursor_position);
         }
     }
@@ -491,9 +473,15 @@ fn up(state: &mut State) {
 fn down(state: &mut State) {
     if state.input_mode == InputMode::Edit {
         let row = state.get_input_position().1;
-        if row < state.input.len() as u16 - 1 {
-            state.input_cursor_position.1 += 1;
-            move_cursor(state.input_cursor_position);
+        if row + state.paging_index < state.input.len() as u16 - 1 {
+            if row == CHAT_BOX_HEIGHT - 1 && row + state.paging_index + 1 < state.input.len() as u16
+            {
+                state.paging_index += 1;
+            } else {
+                state.input_cursor_position.1 += 1;
+                clamp_input_position(state);
+                move_cursor(state.input_cursor_position);
+            }
         }
     }
 }
@@ -516,7 +504,13 @@ fn enter(state: &mut State) -> bool {
     if state.input_mode == InputMode::Edit {
         state.input.push(String::new());
         state.input_cursor_position.0 = PROMPT.len() as u16;
-        state.input_cursor_position.1 += 1;
+
+        let row = state.get_input_position().1;
+        if row == CHAT_BOX_HEIGHT - 1 {
+            state.paging_index += 1;
+        } else {
+            state.input_cursor_position.1 += 1;
+        }
     }
 
     true
@@ -537,7 +531,7 @@ fn input(state: &mut State, c: char) -> bool {
         }
     } else {
         let (col, row) = state.get_input_position();
-        state.input[row as usize].insert(col as usize, c);
+        state.input[row as usize + state.paging_index as usize].insert(col as usize, c);
         state.input_cursor_position.0 += 1;
     }
 
@@ -547,16 +541,24 @@ fn input(state: &mut State, c: char) -> bool {
 fn backspace(state: &mut State) {
     if state.input_mode == InputMode::Edit {
         let (col, row) = state.get_input_position();
+        let line_number = (row + state.paging_index) as usize;
         if col > 0 {
-            state.input[row as usize].remove(col as usize - 1);
+            state.input[line_number].remove(col as usize - 1);
             state.input_cursor_position.0 -= 1;
             move_cursor(state.input_cursor_position);
-        } else if row > 0 {
-            state.input.remove(row as usize);
+        } else if line_number > 0 {
+            let removed_line = state.input.remove(line_number);
             state.input_cursor_position.0 =
-                state.input[(row as usize) - 1].len() as u16 + PROMPT.len() as u16;
-            state.input_cursor_position.1 -= 1;
+                state.input[line_number - 1].len() as u16 + PROMPT.len() as u16;
+
+            if row > 0 && state.paging_index == 0 {
+                state.input_cursor_position.1 -= 1;
+            } else if state.paging_index > 0 {
+                state.paging_index -= 1;
+            }
+
             move_cursor(state.input_cursor_position);
+            state.input[line_number - 1].push_str(&removed_line);
         }
     }
 }

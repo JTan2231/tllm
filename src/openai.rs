@@ -2,7 +2,7 @@ use std::env;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
-#[derive(PartialEq, Clone)]
+#[derive(PartialEq, Clone, Debug)]
 pub enum MessageType {
     System,
     User,
@@ -21,7 +21,7 @@ impl MessageType {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Message {
     pub message_type: MessageType,
     pub content: String,
