@@ -1,3 +1,4 @@
+use copypasta::{ClipboardContext, ClipboardProvider};
 use std::io::Write;
 
 use crossterm::{
@@ -9,6 +10,10 @@ use crossterm::{
 mod openai;
 
 // fairly sure this whole program doesn't play nice with unicode
+//
+// TODO: I think the paging logic needs abstracted
+//       to each individual window, the state struct is
+//       starting to feel a little bloated
 
 #[derive(Debug)]
 struct Flags {
@@ -147,7 +152,7 @@ fn main() {
             config.system_prompt = system_prompt;
         }
 
-        display();
+        terminal_app();
     }
 }
 
@@ -175,6 +180,7 @@ fn wrap(text: &String, width: usize) -> Vec<String> {
     while i < chars.len() {
         let mut newline = false;
         let mut j = i + 1;
+        // retrieve the next word
         while j < chars.len() {
             if chars[j] == ' ' {
                 break;
@@ -191,7 +197,6 @@ fn wrap(text: &String, width: usize) -> Vec<String> {
         if newline {
             current_line.push_str(&chars[i..j].iter().collect::<String>());
             lines.push(current_line);
-            lines.push("".to_string());
             current_line = String::new();
             i = j + 1;
             continue;
@@ -224,12 +229,16 @@ struct State {
     input: Vec<String>,
     input_mode: InputMode,
     paging_index: u16,
+    chat_paging_index: u16,
     // these 2 are (x, y) coordinates
     // and will _always_ be relative to the terminal window
     input_cursor_position: (u16, u16),
     highlight_cursor_position: (u16, u16),
 }
 
+// NOTE: all of these currently only account for the input paging index
+//       really, the chat_paging index et al. should be accounted for 
+//       in an entirely different struct
 impl State {
     // changing origin from terminal window to input box
     //
@@ -242,13 +251,17 @@ impl State {
         )
     }
 
+    fn get_current_line_number(&self) -> usize {
+        self.get_input_position().1 + self.paging_index
+    }
+
     fn get_current_line(&self) -> String {
         let row = self.get_input_position().1;
         self.input[(self.paging_index + row) as usize].clone()
     }
 }
 
-fn display() {
+fn terminal_app() {
     enable_raw_mode().unwrap();
     execute!(std::io::stdout(), Clear(ClearType::All)).unwrap();
     print!("{}", PROMPT);
@@ -263,6 +276,7 @@ fn display() {
         input: Vec::from([String::new()]),
         input_mode: InputMode::Command,
         paging_index: 0,
+        chat_paging_index: 0,
         input_cursor_position: (PROMPT.len() as u16, height - CHAT_BOX_HEIGHT),
         highlight_cursor_position: (PROMPT.len() as u16, height - CHAT_BOX_HEIGHT),
     };
@@ -275,16 +289,19 @@ fn display() {
             Ok(true) => match event::read() {
                 Ok(Event::Key(key_event)) => match key_event.code {
                     KeyCode::Enter => {
-                        if key_event
+                        // KeyModifiers don't work on Enter??
+                        /*if key_event
                             .modifiers
-                            .contains(crossterm::event::KeyModifiers::SHIFT)
-                        {
-                            shift_enter(&mut state_queue);
+                            .contains(crossterm::event::KeyModifiers::CONTROL)
+                        {*/
+                        if state.input_mode == InputMode::Command {
+                            chat_submit(&mut state_queue);
                         } else {
                             running = enter(&mut state_queue);
                         }
                     }
 
+                    // why does this take so long?
                     KeyCode::Esc => {
                         state_queue.input_mode = InputMode::Command;
                         cursor_to_block();
@@ -312,7 +329,7 @@ fn display() {
                     }
 
                     KeyCode::Char(c) => {
-                        running = input(&mut state_queue, c);
+                        running = input(&mut state_queue, c, key_event.modifiers);
                     }
                     _ => {}
                 },
@@ -344,15 +361,31 @@ fn display() {
     disable_raw_mode().unwrap();
 }
 
+fn draw_lines(lines: &[String], current_row: u16) {
+    move_cursor((PROMPT.len() as u16, current_row));
+    let mut current_row = current_row;
+    for line in lines.iter() {
+        execute!(std::io::stdout(), Clear(ClearType::CurrentLine)).unwrap();
+        let display_line = if line.ends_with('\n') {
+            line[0..line.len() - 1 as usize].to_string()
+        } else {
+            line.clone()
+        };
+        print!("{}", display_line);
+        current_row += 1;
+        move_cursor((PROMPT.len() as u16, current_row));
+    }
+}
+
 fn draw(state: &State, redraw_messages: bool, redraw_input: bool) {
     move_cursor((0, 0));
 
     if redraw_messages {
         execute!(std::io::stdout(), Clear(ClearType::All)).unwrap();
-        // message box
-        // this is the chat history
+
         // minus 1 for the separator
-        let message_box_height = crossterm::terminal::size().unwrap().1 - CHAT_BOX_HEIGHT - 1;
+        let message_box_height =
+            (crossterm::terminal::size().unwrap().1 - CHAT_BOX_HEIGHT - 1) as usize;
         let mut message_lines = Vec::new();
         for message in &state.messages {
             message_lines.extend(wrap(
@@ -362,24 +395,24 @@ fn draw(state: &State, redraw_messages: bool, redraw_input: bool) {
             message_lines.push("---".to_string());
         }
 
-        while message_lines.len() < message_box_height as usize {
+        while message_lines.len() < message_box_height {
             message_lines.push("".to_string());
         }
 
-        let mut display_count = 0;
-        for line in message_lines.iter().rev() {
-            if display_count >= message_box_height {
-                break;
-            }
+        let paging_index = state.chat_paging_index as usize;
+        let display_lines = &message_lines
+            [paging_index..std::cmp::min(paging_index + message_box_height, message_lines.len())];
 
-            print!("  {}\n", line);
-            display_count += 1;
-        }
+        draw_lines(display_lines, 0);
 
-        print!("  ------\n");
+        move_cursor((
+            PROMPT.len() as u16,
+            crossterm::terminal::size().unwrap().1 - CHAT_BOX_HEIGHT - 1,
+        ));
+        print!("------");
     }
 
-    let mut current_row = crossterm::terminal::size().unwrap().1 - CHAT_BOX_HEIGHT;
+    let current_row = crossterm::terminal::size().unwrap().1 - CHAT_BOX_HEIGHT;
     move_cursor((PROMPT.len() as u16, current_row));
 
     if redraw_input {
@@ -392,17 +425,7 @@ fn draw(state: &State, redraw_messages: bool, redraw_input: bool) {
             &state.input
         };
 
-        for line in lines.iter() {
-            execute!(std::io::stdout(), Clear(ClearType::CurrentLine)).unwrap();
-            let display_line = if line.ends_with('\n') {
-                line[0..line.len() - 1 as usize].to_string()
-            } else {
-                line.clone()
-            };
-            print!("{}", display_line);
-            current_row += 1;
-            move_cursor((PROMPT.len() as u16, current_row));
-        }
+        draw_lines(lines, current_row);
     }
 
     if state.input_mode == InputMode::Edit {
@@ -419,6 +442,10 @@ fn input_origin() -> (u16, u16) {
         PROMPT.len() as u16,
         crossterm::terminal::size().unwrap().1 - CHAT_BOX_HEIGHT,
     )
+}
+
+fn window_width() -> u16 {
+    crossterm::terminal::size().unwrap().0
 }
 
 fn move_cursor(position: (u16, u16)) {
@@ -496,8 +523,18 @@ fn cursor_to_block() {
     std::io::stdout().flush().unwrap();
 }
 
-fn shift_enter(_state: &mut State) {
-    panic!("Chat submission not yet implemented!");
+fn chat_submit(state: &mut State) {
+    let message = state.input.join("\n").trim().to_string();
+    state
+        .messages
+        .push(openai::Message::new(openai::MessageType::User, message));
+
+    state.input = vec![String::new()];
+    let origin = input_origin();
+    state.input_cursor_position.0 = origin.0;
+    state.input_cursor_position.1 = origin.1;
+
+    move_cursor(state.input_cursor_position);
 }
 
 fn enter(state: &mut State) -> bool {
@@ -516,7 +553,12 @@ fn enter(state: &mut State) -> bool {
     true
 }
 
-fn input(state: &mut State, c: char) -> bool {
+fn get_clipboard_text() -> String {
+    let mut ctx = ClipboardContext::new().unwrap();
+    ctx.get_contents().unwrap()
+}
+
+fn input(state: &mut State, c: char, key_modifiers: crossterm::event::KeyModifiers) -> bool {
     if state.input_mode == InputMode::Command {
         if c == 'a' {
             state.input_mode = InputMode::Edit;
@@ -530,9 +572,33 @@ fn input(state: &mut State, c: char) -> bool {
             return false;
         }
     } else {
+        if c == 'v' && key_modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+            let clipboard_text = wrap(&get_clipboard_text(), window_width() as usize);
+
+            if clipboard_text.is_empty() {
+                return true;
+            }
+
+            let (col, row) = state.get_input_position();
+            let remainder = &state.input[col..];
+
+            let mut added_lines = 0;
+            for line in clipboard_text {
+                state.input[
+        }
+
         let (col, row) = state.get_input_position();
-        state.input[row as usize + state.paging_index as usize].insert(col as usize, c);
-        state.input_cursor_position.0 += 1;
+        let line_number = row as usize + state.paging_index as usize;
+        if state.input[line_number].len() == window_width() as usize - 1 {
+            state
+                .input
+                .insert(line_number + 1, String::from(format!("{}", c)));
+            state.input_cursor_position.0 = PROMPT.len() as u16 + 1;
+            state.input_cursor_position.1 += 1;
+        } else {
+            state.input[line_number].insert(col as usize, c);
+            state.input_cursor_position.0 += 1;
+        }
     }
 
     return true;
