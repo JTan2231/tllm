@@ -6,7 +6,6 @@ use std::net::TcpStream;
 pub enum MessageType {
     System,
     User,
-    Separator,
     Assistant,
 }
 
@@ -15,7 +14,6 @@ impl MessageType {
         match self {
             MessageType::System => "system".to_string(),
             MessageType::User => "user".to_string(),
-            MessageType::Separator => "".to_string(),
             MessageType::Assistant => "assistant".to_string(),
         }
     }
@@ -33,10 +31,6 @@ impl Message {
             message_type,
             content,
         }
-    }
-
-    pub fn to_string(&self) -> String {
-        format!("{}", self.content)
     }
 }
 
