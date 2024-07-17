@@ -87,25 +87,33 @@ pub fn prompt(chat_history: &Vec<Message>) -> String {
         .read_to_string(&mut response)
         .expect("Failed to read from stream");
 
-    let response_body = response.split("\r\n\r\n").collect::<Vec<&str>>()[1];
+    let parts = response.split("\r\n\r\n").collect::<Vec<&str>>();
+    let headers = parts[0];
+    let response_body = parts[1];
     let mut remaining = response_body;
     let mut decoded_body = String::new();
-    while !remaining.is_empty() {
-        if let Some(index) = remaining.find("\r\n") {
-            let (size_str, rest) = remaining.split_at(index);
-            let size = usize::from_str_radix(size_str.trim(), 16).unwrap_or(0);
 
-            if size == 0 {
+    // they like to use this transfer encoding for long responses
+    if headers.contains("Transfer-Encoding: chunked") {
+        while !remaining.is_empty() {
+            if let Some(index) = remaining.find("\r\n") {
+                let (size_str, rest) = remaining.split_at(index);
+                let size = usize::from_str_radix(size_str.trim(), 16).unwrap_or(0);
+
+                if size == 0 {
+                    break;
+                }
+
+                let chunk = &rest[2..2 + size];
+                decoded_body.push_str(chunk);
+
+                remaining = &rest[2 + size + 2..];
+            } else {
                 break;
             }
-
-            let chunk = &rest[2..2 + size];
-            decoded_body.push_str(chunk);
-
-            remaining = &rest[2 + size + 2..];
-        } else {
-            break;
         }
+    } else {
+        decoded_body = response_body.to_string();
     }
 
     let response_json: serde_json::Value = match serde_json::from_str(&decoded_body) {
@@ -113,8 +121,7 @@ pub fn prompt(chat_history: &Vec<Message>) -> String {
         Err(e) => {
             eprintln!("Failed to parse JSON: {}", e);
             eprintln!("Request: {}", request);
-            eprintln!("Raw response: {}", response);
-            eprintln!("Response: {}", decoded_body);
+            eprintln!("Response: {:?}", response);
             std::process::exit(1);
         }
     };
@@ -125,6 +132,10 @@ pub fn prompt(chat_history: &Vec<Message>) -> String {
         .replace("\\\"", "\"")
         .replace("\\'", "'")
         .replace("\\\\", "\\");
+
+    if content.starts_with("\"") && content.ends_with("\"") {
+        content = content[1..content.len() - 1].to_string();
+    }
 
     content
 }

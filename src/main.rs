@@ -293,8 +293,20 @@ impl State {
     fn push_message(&mut self, message: openai::Message) {
         self.messages.push(message.clone());
         let lines = wrap(&message.content, window_width() as usize - PROMPT.len() - 1);
+
+        if message.message_type == openai::MessageType::User {
+            self.chat_display.push("───".to_string());
+        }
         self.chat_display.extend(lines);
-        self.chat_display.push("---".to_string());
+        if message.message_type == openai::MessageType::User {
+            self.chat_display.push("───".to_string());
+        }
+
+        // move to the bottom on updates
+        if self.chat_display.len() > window_height() as usize - CHAT_BOX_HEIGHT as usize - 2 {
+            self.chat_paging_index =
+                self.chat_display.len() as u16 - (window_height() - CHAT_BOX_HEIGHT - 2);
+        }
     }
 }
 
@@ -323,7 +335,7 @@ fn terminal_app() {
 
     let mut running = true;
     while running {
-        match event::poll(std::time::Duration::from_millis(5)) {
+        match event::poll(std::time::Duration::from_millis(1)) {
             Ok(true) => match event::read() {
                 Ok(Event::Key(key_event)) => match key_event.code {
                     KeyCode::Enter => {
@@ -385,7 +397,6 @@ fn terminal_app() {
                     Some(last_message) => {
                         if last_message.message_type == openai::MessageType::User {
                             let response = openai::prompt(&state.messages);
-                            log(&format!("gpt response: {:?}", response));
                             state_queue.push_message(openai::Message::new(
                                 openai::MessageType::Assistant,
                                 response,
@@ -397,7 +408,9 @@ fn terminal_app() {
 
                 draw(
                     &state_queue,
-                    state.messages.len() != state_queue.messages.len() || init,
+                    state.messages.len() != state_queue.messages.len()
+                        || init
+                        || state.chat_paging_index != state_queue.chat_paging_index,
                     state.input != state_queue.input
                         || init
                         || state.paging_index != state_queue.paging_index,
@@ -467,7 +480,7 @@ fn draw(state: &State, redraw_messages: bool, redraw_input: bool) {
             PROMPT.len() as u16,
             crossterm::terminal::size().unwrap().1 - CHAT_BOX_HEIGHT - 1,
         ));
-        print!("------");
+        print!("──────");
     }
 
     let current_row = crossterm::terminal::size().unwrap().1 - CHAT_BOX_HEIGHT;
@@ -580,14 +593,19 @@ fn up(state: &mut State) {
 
 // wet code because the borrow checker is horrible
 // moving to zig after this project
-//
-// TODO: incorporate paging here for command mode
 fn down(state: &mut State) {
+    log(&format!(
+        "{}, {}, {}",
+        state.chat_paging_index,
+        state.chat_display.len(),
+        window_height() - CHAT_BOX_HEIGHT - 2
+    ));
     match state.input_mode {
         InputMode::Command => {
             let row = state.get_chat_position().1;
-            if row + state.chat_paging_index < state.chat_display.len() as u16 {
-                if row == CHAT_BOX_HEIGHT - 1
+            if row + state.chat_paging_index + 1 < state.chat_display.len() as u16 {
+                // one above the separator makes minus 2
+                if row == window_height() - CHAT_BOX_HEIGHT - 2
                     && row + state.chat_paging_index + 1 < state.chat_display.len() as u16
                 {
                     state.chat_paging_index += 1;
@@ -715,13 +733,6 @@ fn input(state: &mut State, c: char, key_modifiers: crossterm::event::KeyModifie
 
             state.input_cursor_position.1 =
                 std::cmp::min(state.input_cursor_position.1, total_height - 1);
-
-            log(&format!(
-                "{}, {:?}, {}",
-                state.input.len(),
-                state.get_input_position(),
-                state.paging_index
-            ));
 
             move_cursor(state.input_cursor_position);
         } else {
