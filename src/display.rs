@@ -140,8 +140,6 @@ impl State {
     fn get_input_position(&self) -> (u16, u16) {
         let origin = input_origin();
 
-        log(&format!("{:?}, {:?}", self.input_cursor_position, origin));
-
         (
             self.input_cursor_position.0 - origin.0,
             self.input_cursor_position.1 - origin.1,
