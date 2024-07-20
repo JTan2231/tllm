@@ -46,6 +46,11 @@ impl Flag {
 }
 
 fn main() {
+    match std::env::var("OPENAI_API_KEY") {
+        Ok(_) => (),
+        Err(_) => panic!("OPENAI_API_KEY environment variable not set"),
+    }
+
     let home_dir = match std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .or_else(|_| {
