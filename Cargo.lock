@@ -776,6 +776,7 @@ dependencies = [
  "copypasta",
  "crossterm",
  "native-tls",
+ "serde",
  "serde_json",
 ]
 

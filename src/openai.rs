@@ -1,8 +1,11 @@
 use std::env;
-use std::io::{Read, Write};
+use std::io::BufRead;
+use std::io::Write;
 use std::net::TcpStream;
 
-#[derive(PartialEq, Clone, Debug)]
+use crate::display::log;
+
+#[derive(PartialEq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum MessageType {
     System,
     User,
@@ -19,7 +22,7 @@ impl MessageType {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Message {
     pub message_type: MessageType,
     pub content: String,
@@ -35,18 +38,19 @@ impl Message {
 }
 
 // TODO: streaming to interface
-pub fn prompt(chat_history: &Vec<Message>) -> String {
+pub fn prompt(chat_history: &Vec<Message>, tx: std::sync::mpsc::Sender<String>) {
     let host = "api.openai.com";
     let path = "/v1/chat/completions";
     let port = 443;
     let body = serde_json::json!({
-        "model": "gpt-4o",
+        "model": "gpt-4o-mini",
         "messages": chat_history.iter().map(|message| {
             serde_json::json!({
                 "role": message.message_type.to_string(),
                 "content": message.content
             })
         }).collect::<Vec<serde_json::Value>>(),
+        "stream": true,
     });
 
     let json = serde_json::json!(body);
@@ -61,7 +65,8 @@ pub fn prompt(chat_history: &Vec<Message>) -> String {
         Content-Type: application/json\r\n\
         Content-Length: {}\r\n\
         Authorization: Bearer {}\r\n\
-        Connection: close\r\n\r\n\
+        Accept: text/event-stream\r\n\
+        Connection: keep-alive\r\n\r\n\
         {}",
         path,
         host,
@@ -82,60 +87,47 @@ pub fn prompt(chat_history: &Vec<Message>) -> String {
         .expect("Failed to write to stream");
     stream.flush().expect("Failed to flush stream");
 
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .expect("Failed to read from stream");
+    let mut reader = std::io::BufReader::new(stream);
+    let mut headers = String::new();
+    while reader.read_line(&mut headers).unwrap() > 2 {
+        if headers == "\r\n" {
+            break;
+        }
 
-    let parts = response.split("\r\n\r\n").collect::<Vec<&str>>();
-    let headers = parts[0];
-    let response_body = parts[1];
-    let mut remaining = response_body;
-    let mut decoded_body = String::new();
+        headers.clear();
+    }
 
-    // they like to use this transfer encoding for long responses
-    if headers.contains("Transfer-Encoding: chunked") {
-        while !remaining.is_empty() {
-            if let Some(index) = remaining.find("\r\n") {
-                let (size_str, rest) = remaining.split_at(index);
-                let size = usize::from_str_radix(size_str.trim(), 16).unwrap_or(0);
+    let mut event_buffer = String::new();
+    while reader.read_line(&mut event_buffer).unwrap() > 0 {
+        if event_buffer.starts_with("data: ") {
+            let payload = event_buffer[6..].trim();
 
-                if size == 0 {
-                    break;
-                }
-
-                let chunk = &rest[2..2 + size];
-                decoded_body.push_str(chunk);
-
-                remaining = &rest[2 + size + 2..];
-            } else {
+            if payload.is_empty() || payload == "[DONE]" {
                 break;
             }
+
+            let response_json: serde_json::Value = match serde_json::from_str(&payload) {
+                Ok(json) => json,
+                Err(e) => {
+                    log(&format!("JSON parse error: {}", e));
+                    log(&format!("Error payload: {}", payload));
+
+                    serde_json::Value::Null
+                }
+            };
+
+            let delta = response_json["choices"][0]["delta"]["content"]
+                .to_string()
+                .replace("\\n", "\n")
+                .replace("\\\"", "\"")
+                .replace("\\'", "'")
+                .replace("\\\\", "\\");
+
+            if delta != "null" {
+                tx.send(delta).expect("Failed to send OAI delta");
+            }
         }
-    } else {
-        decoded_body = response_body.to_string();
+
+        event_buffer.clear();
     }
-
-    let response_json: serde_json::Value = match serde_json::from_str(&decoded_body) {
-        Ok(json) => json,
-        Err(e) => {
-            eprintln!("Failed to parse JSON: {}", e);
-            eprintln!("Request: {}", request);
-            eprintln!("Response: {:?}", response);
-            std::process::exit(1);
-        }
-    };
-
-    let mut content = response_json["choices"][0]["message"]["content"].to_string();
-    content = content
-        .replace("\\n", "\n")
-        .replace("\\\"", "\"")
-        .replace("\\'", "'")
-        .replace("\\\\", "\\");
-
-    if content.starts_with("\"") && content.ends_with("\"") {
-        content = content[1..content.len() - 1].to_string();
-    }
-
-    content
 }
