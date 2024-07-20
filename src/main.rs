@@ -46,6 +46,39 @@ impl Flag {
 }
 
 fn main() {
+    let home_dir = match std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .or_else(|_| {
+            std::env::var("HOMEDRIVE").and_then(|homedrive| {
+                std::env::var("HOMEPATH").map(|homepath| format!("{}{}", homedrive, homepath))
+            })
+        }) {
+        Ok(dir) => std::path::PathBuf::from(dir),
+        Err(_) => panic!("Failed to get home directory"),
+    };
+
+    let dir_path = home_dir.join(".local/tllm");
+    let conversations_path = dir_path.join("conversations");
+
+    // Check if the main directory exists, if not, create it
+    if !dir_path.exists() {
+        match std::fs::create_dir_all(&dir_path) {
+            Ok(_) => (),
+            Err(e) => panic!("Failed to create directory: {:?}, {}", dir_path, e),
+        };
+    }
+
+    // Check if the conversations subdirectory exists, if not, create it
+    if !conversations_path.exists() {
+        match std::fs::create_dir_all(&conversations_path) {
+            Ok(_) => (),
+            Err(e) => panic!(
+                "Failed to create directory: {:?}, {}",
+                conversations_path, e
+            ),
+        };
+    }
+
     let args: Vec<String> = std::env::args().collect();
 
     fn index_check(i: usize, args: &Vec<String>, flag: &str) {
@@ -146,6 +179,28 @@ fn main() {
             config.system_prompt = system_prompt;
         }
 
-        display::terminal_app();
+        let messages = display::terminal_app();
+
+        if messages.len() > 0 {
+            let now: String = chrono::Local::now().timestamp_micros().to_string();
+            let messages_json = serde_json::to_string(&messages).unwrap();
+            let destination = conversations_path.join(now.clone());
+            let destination = match destination.to_str() {
+                Some(s) => format!("{}.json", s),
+                None => panic!(
+                    "Failed to convert path to string: {:?} + {:?}",
+                    conversations_path, now
+                ),
+            };
+
+            match std::fs::write(destination.clone(), messages_json) {
+                Ok(_) => {
+                    println!("Conversation saved to {}", destination);
+                }
+                Err(e) => {
+                    println!("Error saving messages: {}", e);
+                }
+            }
+        }
     }
 }

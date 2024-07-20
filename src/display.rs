@@ -139,6 +139,9 @@ impl State {
     // this _DOES NOT_ adjust for paging
     fn get_input_position(&self) -> (u16, u16) {
         let origin = input_origin();
+
+        log(&format!("{:?}, {:?}", self.input_cursor_position, origin));
+
         (
             self.input_cursor_position.0 - origin.0,
             self.input_cursor_position.1 - origin.1,
@@ -251,9 +254,45 @@ impl State {
 
         self.messages.last_mut().unwrap().content.push_str(&delta);
     }
+
+    // indices based on a (0, 0) origin
+    // mapped to their respective origins
+    // dependent on input mode
+    fn map_index_and_move(&mut self, col: u16, row: u16) {
+        let mut col = col;
+        let mut row = row;
+        match self.input_mode {
+            InputMode::Edit => {
+                let origin = input_origin();
+                col += origin.0;
+                row += origin.1;
+
+                self.input_cursor_position.0 = col as u16;
+                self.input_cursor_position.1 = row as u16;
+
+                self.input_cursor_position.0 = clamp(
+                    self.input_cursor_position.0,
+                    self.get_current_line_length() as u16,
+                );
+
+                move_cursor(self.input_cursor_position);
+            }
+            InputMode::Command => {
+                self.highlight_cursor_position.0 = col + PROMPT.len() as u16;
+                self.highlight_cursor_position.1 = row as u16;
+
+                self.highlight_cursor_position.0 = clamp(
+                    self.highlight_cursor_position.0,
+                    self.get_current_line_length() as u16,
+                );
+
+                move_cursor(self.highlight_cursor_position);
+            }
+        }
+    }
 }
 
-pub fn terminal_app() {
+pub fn terminal_app() -> Vec<openai::Message> {
     enable_raw_mode().unwrap();
     execute!(std::io::stdout(), Clear(ClearType::All)).unwrap();
     print!("{}", PROMPT);
@@ -277,8 +316,6 @@ pub fn terminal_app() {
     let mut state_queue = state.clone();
 
     let (tx, rx) = std::sync::mpsc::channel();
-
-    let now: String = chrono::Local::now().timestamp_micros().to_string();
 
     let mut running = true;
     while running {
@@ -310,7 +347,8 @@ pub fn terminal_app() {
                             .modifiers
                             .contains(crossterm::event::KeyModifiers::CONTROL)
                         {
-                            previous_word(&mut state_queue);
+                            let (col, row) = previous_word(&mut state_queue);
+                            state_queue.map_index_and_move(col, row);
                         } else {
                             left(state_queue.get_mut_mode_position(), PROMPT.len() as u16);
                         }
@@ -321,11 +359,12 @@ pub fn terminal_app() {
                             .modifiers
                             .contains(crossterm::event::KeyModifiers::CONTROL)
                         {
-                            next_word(&mut state_queue);
+                            let (col, row) = next_word(&mut state_queue);
+                            state_queue.map_index_and_move(col, row);
                         } else {
                             right(
                                 state_queue.get_mut_mode_position(),
-                                state.get_current_line_length() as u16 + 1,
+                                state.get_current_line_length() as u16 + PROMPT.len() as u16,
                             );
                         }
                     }
@@ -353,7 +392,13 @@ pub fn terminal_app() {
                     }
 
                     KeyCode::Backspace => {
-                        backspace(&mut state_queue);
+                        if key_event
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL)
+                        {
+                        } else {
+                            backspace(&mut state_queue);
+                        }
                     }
 
                     KeyCode::Char(c) => {
@@ -417,20 +462,10 @@ pub fn terminal_app() {
     execute!(std::io::stdout(), Clear(ClearType::All)).unwrap();
     disable_raw_mode().unwrap();
 
-    if state.messages.len() > 0 {
-        let messages_json = serde_json::to_string(&state.messages).unwrap();
-        match std::fs::write(format!("{}.json", now), messages_json) {
-            Ok(_) => {
-                println!("Conversation saved to {}.json", now);
-            }
-            Err(e) => {
-                println!("Error saving messages: {}", e);
-            }
-        }
-    }
-
     println!("Exit");
     cursor_to_block();
+
+    state.messages
 }
 
 fn draw_lines(lines: &[String], current_row: u16) {
@@ -552,11 +587,12 @@ fn right(position: &mut (u16, u16), bound: u16) {
 
 // delicious wet code
 //
-// there are much better ways to structure the code around here
+// i'm sure there are much better ways to structure the code around here
 // but unfortunately i am an inexperienced, filthy individual
 //
-// untested refactor
-fn next_word(state: &mut State) {
+// updates the state's cursor position (input_mode dependent)
+// to find the next word
+fn next_word(state: &mut State) -> (u16, u16) {
     let (pos, mut paging_index, row_bound, paging_index_bound, display_lines) =
         match state.input_mode {
             InputMode::Edit => {
@@ -646,39 +682,53 @@ fn next_word(state: &mut State) {
         }
     }
 
-    //col = std::cmp::max(0, col);
-    match state.input_mode {
-        InputMode::Edit => {
-            state.input_cursor_position.0 = (col + PROMPT.len()) as u16;
-            state.input_cursor_position.1 = row as u16;
-
-            state.input_cursor_position.0 = clamp(
-                state.input_cursor_position.0,
-                state.get_current_line_length() as u16,
-            );
-
-            move_cursor(state.input_cursor_position);
-        }
-        InputMode::Command => {
-            state.highlight_cursor_position.0 = (col + PROMPT.len()) as u16;
-            state.highlight_cursor_position.1 = row as u16;
-
-            state.highlight_cursor_position.0 = clamp(
-                state.highlight_cursor_position.0,
-                state.get_current_line_length() as u16,
-            );
-
-            move_cursor(state.highlight_cursor_position);
-        }
-    }
+    (col as u16, row as u16)
 }
 
-fn previous_word(state: &mut State) {
-    let pos = state.get_chat_position();
+fn previous_word(state: &mut State) -> (u16, u16) {
+    let (pos, mut paging_index, row_bound, paging_index_bound, display_lines) =
+        match state.input_mode {
+            InputMode::Edit => {
+                let pos = state.get_input_position();
+                let paging_index = state.paging_index as usize;
+                let row_bound = 0;
+                let paging_index_bound = state.paging_index as usize;
+                let display_lines = &state.input;
+
+                (
+                    pos,
+                    paging_index,
+                    row_bound,
+                    paging_index_bound,
+                    display_lines,
+                )
+            }
+            InputMode::Command => {
+                let pos = state.get_chat_position();
+                let paging_index = state.chat_paging_index as usize;
+                let row_bound = 0;
+                let paging_index_bound = state.chat_display.len()
+                    - (window_height() as usize - CHAT_BOX_HEIGHT as usize - 1);
+                let display_lines = &state.chat_display;
+
+                (
+                    pos,
+                    paging_index,
+                    row_bound,
+                    paging_index_bound,
+                    display_lines,
+                )
+            }
+        };
+
     let mut col = pos.0 as i16;
     let mut row = pos.1 as i16;
 
     let mut chars = state.get_current_line().chars().collect::<Vec<char>>();
+
+    // doing this feels like band-aid patch
+    // is there a better place to address the bounds?
+    col = std::cmp::min(col, chars.len() as i16 - 1);
 
     // if we're already in whitespace, find the next word
     while chars.len() == 0 || (col > -1 && chars[col as usize] == ' ') {
@@ -688,13 +738,13 @@ fn previous_word(state: &mut State) {
             let bounds = state.cursor_position_to_string_position((col as u16, row as u16));
 
             if bounds.1 > 0 {
-                if row == 0 && state.chat_paging_index > 0 {
-                    state.chat_paging_index -= 1;
+                if row == row_bound && paging_index > paging_index_bound {
+                    paging_index -= 1;
                 } else {
                     row -= 1;
                 }
 
-                chars = state.chat_display[(bounds.1 - 1) as usize]
+                chars = display_lines[(bounds.1 - 1) as usize]
                     .chars()
                     .collect::<Vec<char>>();
 
@@ -712,13 +762,13 @@ fn previous_word(state: &mut State) {
             let bounds = state.cursor_position_to_string_position((col as u16, row as u16));
 
             if bounds.1 > 0 {
-                if row == 0 && state.chat_paging_index > 0 {
-                    state.chat_paging_index -= 1;
+                if row == row_bound && paging_index > paging_index_bound {
+                    paging_index -= 1;
                 } else {
                     row -= 1;
                 }
 
-                chars = state.chat_display[(bounds.1 - 1) as usize]
+                chars = display_lines[(bounds.1 - 1) as usize]
                     .chars()
                     .collect::<Vec<char>>();
 
@@ -731,15 +781,7 @@ fn previous_word(state: &mut State) {
 
     col = std::cmp::max(col, 0);
 
-    state.highlight_cursor_position.0 = (col as usize + PROMPT.len()) as u16;
-    state.highlight_cursor_position.1 = row as u16;
-
-    state.highlight_cursor_position.0 = clamp(
-        state.highlight_cursor_position.0,
-        state.get_current_line_length() as u16,
-    );
-
-    move_cursor(state.highlight_cursor_position);
+    (col as u16, row as u16)
 }
 
 // wet code because the borrow checker is horrible
@@ -754,8 +796,10 @@ fn up(state: &mut State) {
                 state.input_cursor_position.1 -= 1;
 
                 let line = state.get_current_line();
-                state.input_cursor_position.0 =
-                    clamp(state.input_cursor_position.0, line.len() as u16);
+                state.input_cursor_position.0 = clamp(
+                    state.input_cursor_position.0,
+                    (line.len() + PROMPT.len()) as u16,
+                );
 
                 move_cursor(state.input_cursor_position);
             }
@@ -813,8 +857,10 @@ fn down(state: &mut State) {
                     state.input_cursor_position.1 += 1;
 
                     let line = state.get_current_line();
-                    state.input_cursor_position.0 =
-                        clamp(state.input_cursor_position.0, line.len() as u16);
+                    state.input_cursor_position.0 = clamp(
+                        state.input_cursor_position.0,
+                        (line.len() + PROMPT.len()) as u16,
+                    );
 
                     move_cursor(state.input_cursor_position);
                 }
@@ -887,7 +933,11 @@ fn chat_submit(state: &mut State) {
 
 fn enter(state: &mut State) -> bool {
     if state.input_mode == InputMode::Edit {
-        state.input.push(String::new());
+        let pos = state.get_input_position();
+        let remainder = state.input[pos.1 as usize][pos.0 as usize..].to_string();
+        state.input[pos.1 as usize] = state.input[pos.1 as usize][..pos.0 as usize].to_string();
+
+        state.input.push(remainder);
         state.input_cursor_position.0 = PROMPT.len() as u16;
 
         let row = state.get_input_position().1;
