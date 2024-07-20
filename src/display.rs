@@ -88,6 +88,18 @@ pub fn wrap(text: &String, width: usize) -> Vec<String> {
 //       coordinate planes/origins are handled
 //
 // TODO: error handling in this file is laughable
+//       maybe replace all the raw indexing with `.get()`?
+//
+// TODO: need a better way of dealing with
+//       the different coordinate planes--it's getting confusing
+//       differentiating between input + chat display
+//       (pending refactor)
+//       ..
+//       should we just define a bunch of different common getters?
+//       and include transformations in each?
+//       and assume outside functions just deal with coordinates
+//       without a basis?
+//       much to ponder
 
 #[derive(PartialEq, Clone, Debug)]
 enum InputMode {
@@ -321,7 +333,7 @@ pub fn terminal_app() {
                     KeyCode::Up => {
                         if key_event
                             .modifiers
-                            .contains(crossterm::event::KeyModifiers::CONTROL)
+                            .contains(crossterm::event::KeyModifiers::SHIFT)
                         {
                             page_up(&mut state_queue);
                         } else {
@@ -332,7 +344,7 @@ pub fn terminal_app() {
                     KeyCode::Down => {
                         if key_event
                             .modifiers
-                            .contains(crossterm::event::KeyModifiers::CONTROL)
+                            .contains(crossterm::event::KeyModifiers::SHIFT)
                         {
                             page_down(&mut state_queue);
                         } else {
@@ -539,34 +551,69 @@ fn right(position: &mut (u16, u16), bound: u16) {
 }
 
 // delicious wet code
+//
+// there are much better ways to structure the code around here
+// but unfortunately i am an inexperienced, filthy individual
+//
+// untested refactor
 fn next_word(state: &mut State) {
-    let pos = state.get_chat_position();
+    let (pos, mut paging_index, row_bound, paging_index_bound, display_lines) =
+        match state.input_mode {
+            InputMode::Edit => {
+                let pos = state.get_input_position();
+                let paging_index = state.paging_index as usize;
+                let row_bound = window_height() - 1;
+                let paging_index_bound = state.paging_index as usize;
+                let display_lines = &state.input;
+
+                (
+                    pos,
+                    paging_index,
+                    row_bound,
+                    paging_index_bound,
+                    display_lines,
+                )
+            }
+            InputMode::Command => {
+                let pos = state.get_chat_position();
+                let paging_index = state.chat_paging_index as usize;
+                let row_bound = window_height() - CHAT_BOX_HEIGHT - 2;
+                let paging_index_bound = state.chat_display.len()
+                    - (window_height() as usize - CHAT_BOX_HEIGHT as usize - 1);
+                let display_lines = &state.chat_display;
+
+                (
+                    pos,
+                    paging_index,
+                    row_bound,
+                    paging_index_bound,
+                    display_lines,
+                )
+            }
+        };
+
     let mut col = pos.0 as usize;
     let mut row = pos.1 as usize;
 
     let mut chars = state.get_current_line().chars().collect::<Vec<char>>();
 
     // if we're already in whitespace, find the next word
-    while chars.len() == 0 || ((col as usize) < chars.len() && chars[col as usize] == ' ') {
+    while chars.len() == 0 || (col < chars.len() && chars[col as usize] == ' ') {
         col += 1;
 
         if col >= chars.len() {
             let bounds = state.cursor_position_to_string_position((col as u16, row as u16));
 
-            if bounds.1 + 1 < state.chat_display.len() as u16 {
+            if bounds.1 + 1 < display_lines.len() as u16 {
                 col = 0;
 
-                if row as u16 == window_height() - CHAT_BOX_HEIGHT - 2
-                    && (state.chat_paging_index as usize)
-                        < state.chat_display.len()
-                            - (window_height() as usize - CHAT_BOX_HEIGHT as usize - 1)
-                {
-                    state.chat_paging_index += 1;
+                if row as u16 == row_bound && paging_index < paging_index_bound {
+                    paging_index += 1;
                 } else {
                     row += 1;
                 }
 
-                chars = state.chat_display[(bounds.1 + 1) as usize]
+                chars = display_lines[(bounds.1 + 1) as usize]
                     .chars()
                     .collect::<Vec<char>>();
             } else {
@@ -575,26 +622,22 @@ fn next_word(state: &mut State) {
         }
     }
 
-    while (col as usize) < chars.len() && chars[col as usize] != ' ' {
+    while col < chars.len() && chars[col as usize] != ' ' {
         col += 1;
 
         if col == chars.len() {
             let bounds = state.cursor_position_to_string_position((col as u16, row as u16));
 
-            if bounds.1 + 1 < state.chat_display.len() as u16 {
+            if bounds.1 + 1 < display_lines.len() as u16 {
                 col = 0;
 
-                if row as u16 == window_height() - CHAT_BOX_HEIGHT - 2
-                    && (state.chat_paging_index as usize)
-                        < state.chat_display.len()
-                            - (window_height() as usize - CHAT_BOX_HEIGHT as usize - 1)
-                {
-                    state.chat_paging_index += 1;
+                if row as u16 == row_bound && paging_index < paging_index_bound {
+                    paging_index += 1;
                 } else {
                     row += 1;
                 }
 
-                chars = state.chat_display[(bounds.1 + 1) as usize]
+                chars = display_lines[(bounds.1 + 1) as usize]
                     .chars()
                     .collect::<Vec<char>>();
             } else {
@@ -603,16 +646,31 @@ fn next_word(state: &mut State) {
         }
     }
 
-    col = std::cmp::max(0, col);
-    state.highlight_cursor_position.0 = (col + PROMPT.len()) as u16;
-    state.highlight_cursor_position.1 = row as u16;
+    //col = std::cmp::max(0, col);
+    match state.input_mode {
+        InputMode::Edit => {
+            state.input_cursor_position.0 = (col + PROMPT.len()) as u16;
+            state.input_cursor_position.1 = row as u16;
 
-    state.highlight_cursor_position.0 = clamp(
-        state.highlight_cursor_position.0,
-        state.get_current_line_length() as u16,
-    );
+            state.input_cursor_position.0 = clamp(
+                state.input_cursor_position.0,
+                state.get_current_line_length() as u16,
+            );
 
-    move_cursor(state.highlight_cursor_position);
+            move_cursor(state.input_cursor_position);
+        }
+        InputMode::Command => {
+            state.highlight_cursor_position.0 = (col + PROMPT.len()) as u16;
+            state.highlight_cursor_position.1 = row as u16;
+
+            state.highlight_cursor_position.0 = clamp(
+                state.highlight_cursor_position.0,
+                state.get_current_line_length() as u16,
+            );
+
+            move_cursor(state.highlight_cursor_position);
+        }
+    }
 }
 
 fn previous_word(state: &mut State) {
