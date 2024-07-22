@@ -7,24 +7,14 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
 };
 
+use crate::logger::Logger;
 use crate::openai;
+use crate::{error, info};
 
 const PROMPT: &str = "  ";
 const MESSAGE_SEPARATOR: &str = "───";
 const CHAT_BOX_HEIGHT: u16 = 10;
-const LOG_LOCATION: &str = "./dev";
-const REFRESH_RATE: u64 = 1;
-
-pub fn log(message: &String) {
-    let log_message = format!("{}: {}\n", chrono::Local::now(), message);
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(LOG_LOCATION)
-        .unwrap();
-
-    file.write_all(log_message.as_bytes()).unwrap();
-}
+const POLL_TIMEOUT: u64 = 25; // ms
 
 // wraps text around a given width
 // line breaks on spaces
@@ -101,14 +91,15 @@ pub fn wrap(text: &String, width: usize) -> Vec<String> {
 //       without a basis?
 //       much to ponder
 
-#[derive(PartialEq, Clone, Debug)]
+#[derive(PartialEq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 enum InputMode {
     Edit,
     Command,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct State {
+    input_history: Vec<String>,
     messages: Vec<openai::Message>,
     chat_display: Vec<String>,
     input: Vec<String>,
@@ -127,6 +118,7 @@ struct State {
 // NOTE: all of these currently only account for the input paging index
 //       really, the chat_paging index et al. should be accounted for
 //       in an entirely different struct
+
 impl State {
     // changing origin from terminal window to input box
     // this is still relative to the terminal window,
@@ -290,7 +282,28 @@ impl State {
     }
 }
 
-pub fn terminal_app() -> Vec<openai::Message> {
+fn cleanup(message: String) {
+    move_cursor((0, 0));
+    execute!(std::io::stdout(), Clear(ClearType::All)).unwrap();
+    disable_raw_mode().unwrap();
+
+    println!("{}", message);
+    cursor_to_block();
+}
+
+fn log_state(state: &mut State, c: &str, debug: bool) {
+    state.input_history.push(format!("Char('{}')", c));
+    if debug {
+        info!("{}", serde_json::to_string_pretty(&state).unwrap());
+        info!(
+            "mapped positions: {:?}, {:?}",
+            state.get_input_position(),
+            state.get_chat_position()
+        );
+    }
+}
+
+pub fn terminal_app(system_prompt: String, debug: bool) -> Vec<openai::Message> {
     enable_raw_mode().unwrap();
     execute!(std::io::stdout(), Clear(ClearType::All)).unwrap();
     print!("{}", PROMPT);
@@ -301,6 +314,7 @@ pub fn terminal_app() -> Vec<openai::Message> {
     let height = crossterm::terminal::size().unwrap().1;
 
     let mut state = State {
+        input_history: Vec::new(),
         messages: Vec::new(),
         chat_display: Vec::new(),
         input: Vec::from([String::new()]),
@@ -313,14 +327,20 @@ pub fn terminal_app() -> Vec<openai::Message> {
 
     let mut state_queue = state.clone();
 
+    std::panic::set_hook(Box::new(|panic_info| {
+        error!("{}", panic_info);
+        cleanup("An error occurred!".to_string());
+    }));
+
     let (tx, rx) = std::sync::mpsc::channel();
 
     let mut running = true;
     while running {
-        match event::poll(std::time::Duration::from_millis(REFRESH_RATE)) {
+        match event::poll(std::time::Duration::from_millis(POLL_TIMEOUT)) {
             Ok(true) => match event::read() {
                 Ok(Event::Key(key_event)) => match key_event.code {
                     KeyCode::Enter => {
+                        log_state(&mut state_queue, "Enter", debug);
                         // KeyModifiers don't work on Enter??
                         /*if key_event
                             .modifiers
@@ -335,12 +355,14 @@ pub fn terminal_app() -> Vec<openai::Message> {
 
                     // why does this take so long?
                     KeyCode::Esc => {
+                        log_state(&mut state_queue, "Esc", debug);
                         state_queue.input_mode = InputMode::Command;
                         cursor_to_block();
                         move_cursor(state_queue.highlight_cursor_position);
                     }
 
                     KeyCode::Left => {
+                        log_state(&mut state_queue, "Left", debug);
                         if key_event
                             .modifiers
                             .contains(crossterm::event::KeyModifiers::CONTROL)
@@ -353,6 +375,7 @@ pub fn terminal_app() -> Vec<openai::Message> {
                     }
 
                     KeyCode::Right => {
+                        log_state(&mut state_queue, "Right", debug);
                         if key_event
                             .modifiers
                             .contains(crossterm::event::KeyModifiers::CONTROL)
@@ -368,6 +391,7 @@ pub fn terminal_app() -> Vec<openai::Message> {
                     }
 
                     KeyCode::Up => {
+                        log_state(&mut state_queue, "Up", debug);
                         if key_event
                             .modifiers
                             .contains(crossterm::event::KeyModifiers::SHIFT)
@@ -379,6 +403,7 @@ pub fn terminal_app() -> Vec<openai::Message> {
                     }
 
                     KeyCode::Down => {
+                        log_state(&mut state_queue, "Down", debug);
                         if key_event
                             .modifiers
                             .contains(crossterm::event::KeyModifiers::SHIFT)
@@ -390,6 +415,7 @@ pub fn terminal_app() -> Vec<openai::Message> {
                     }
 
                     KeyCode::Backspace => {
+                        log_state(&mut state_queue, "Backspace", debug);
                         if key_event
                             .modifiers
                             .contains(crossterm::event::KeyModifiers::CONTROL)
@@ -400,6 +426,7 @@ pub fn terminal_app() -> Vec<openai::Message> {
                     }
 
                     KeyCode::Char(c) => {
+                        log_state(&mut state_queue, &c.to_string(), debug);
                         running = input(&mut state_queue, c, key_event.modifiers);
                     }
                     _ => {}
@@ -420,9 +447,10 @@ pub fn terminal_app() -> Vec<openai::Message> {
                             ));
 
                             let messages = state.messages.clone();
+                            let prompt = system_prompt.clone();
                             let tx = tx.clone();
                             std::thread::spawn(move || {
-                                openai::prompt(&messages, tx);
+                                openai::prompt(prompt, &messages, tx);
                             });
                         }
                     }
@@ -456,12 +484,7 @@ pub fn terminal_app() -> Vec<openai::Message> {
         }
     }
 
-    move_cursor((0, 0));
-    execute!(std::io::stdout(), Clear(ClearType::All)).unwrap();
-    disable_raw_mode().unwrap();
-
-    println!("Exit");
-    cursor_to_block();
+    cleanup("Goodbye!".to_string());
 
     state.messages
 }
@@ -932,6 +955,7 @@ fn chat_submit(state: &mut State) {
 fn enter(state: &mut State) -> bool {
     if state.input_mode == InputMode::Edit {
         let pos = state.get_input_position();
+        let pos = (pos.0, pos.1 + state.paging_index);
         let remainder = state.input[pos.1 as usize][pos.0 as usize..].to_string();
         state.input[pos.1 as usize] = state.input[pos.1 as usize][..pos.0 as usize].to_string();
 
@@ -1004,6 +1028,8 @@ fn input(state: &mut State, c: char, key_modifiers: crossterm::event::KeyModifie
         } else {
             let (col, row) = state.get_input_position();
             let line_number = row as usize + state.paging_index as usize;
+            // TODO: keep finding crashes here--what gives?
+            //       how do i even reproduce this
             if state.input[line_number].len() == window_width() as usize - 1 {
                 state
                     .input

@@ -1,7 +1,9 @@
 mod display;
+mod logger;
 mod openai;
 
 // fairly sure this whole program doesn't play nice with unicode
+// untested statement though
 //
 // TODO: I think the paging logic needs abstracted
 //       to each individual window, the state struct is
@@ -45,7 +47,18 @@ impl Flag {
     }
 }
 
+fn create_if_nonexistent(path: &std::path::PathBuf) {
+    if !path.exists() {
+        match std::fs::create_dir_all(&path) {
+            Ok(_) => (),
+            Err(e) => panic!("Failed to create directory: {:?}, {}", path, e),
+        };
+    }
+}
+
 fn main() {
+    let now: String = chrono::Local::now().timestamp_micros().to_string();
+
     match std::env::var("OPENAI_API_KEY") {
         Ok(_) => (),
         Err(_) => panic!("OPENAI_API_KEY environment variable not set"),
@@ -64,25 +77,16 @@ fn main() {
 
     let dir_path = home_dir.join(".local/tllm");
     let conversations_path = dir_path.join("conversations");
+    let logging_path = dir_path.join("logs");
+    logger::Logger::init(format!(
+        "{}/{}.log",
+        logging_path.to_str().unwrap(),
+        now.clone()
+    ));
 
-    // Check if the main directory exists, if not, create it
-    if !dir_path.exists() {
-        match std::fs::create_dir_all(&dir_path) {
-            Ok(_) => (),
-            Err(e) => panic!("Failed to create directory: {:?}, {}", dir_path, e),
-        };
-    }
-
-    // Check if the conversations subdirectory exists, if not, create it
-    if !conversations_path.exists() {
-        match std::fs::create_dir_all(&conversations_path) {
-            Ok(_) => (),
-            Err(e) => panic!(
-                "Failed to create directory: {:?}, {}",
-                conversations_path, e
-            ),
-        };
-    }
+    create_if_nonexistent(&dir_path);
+    create_if_nonexistent(&conversations_path);
+    create_if_nonexistent(&logging_path);
 
     let args: Vec<String> = std::env::args().collect();
 
@@ -179,15 +183,19 @@ fn main() {
         //    display::wrap(&response, display::window_width() as usize).join("\n")
         //);
     } else {
-        let mut config = Flags::new();
-        if let Ok(system_prompt) = std::fs::read_to_string("~/.config/tgpt/system_prompt") {
-            config.system_prompt = system_prompt;
+        let mut system_prompt = String::new();
+        if let Ok(sp) = std::fs::read_to_string("~/.local/tllm/system_prompt") {
+            system_prompt = sp.trim().to_string();
         }
 
-        let messages = display::terminal_app();
+        let mut debug = false;
+        if let Ok(d) = std::env::var("TLLM_DEBUG") {
+            debug = !d.is_empty();
+        }
+
+        let messages = display::terminal_app(system_prompt, debug);
 
         if messages.len() > 0 {
-            let now: String = chrono::Local::now().timestamp_micros().to_string();
             let messages_json = serde_json::to_string(&messages).unwrap();
             let destination = conversations_path.join(now.clone());
             let destination = match destination.to_str() {

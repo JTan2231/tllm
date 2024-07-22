@@ -3,7 +3,8 @@ use std::io::BufRead;
 use std::io::Write;
 use std::net::TcpStream;
 
-use crate::display::log;
+use crate::error;
+use crate::logger::Logger;
 
 #[derive(PartialEq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum MessageType {
@@ -38,13 +39,25 @@ impl Message {
 }
 
 // TODO: streaming to interface
-pub fn prompt(chat_history: &Vec<Message>, tx: std::sync::mpsc::Sender<String>) {
+pub fn prompt(
+    system_prompt: String,
+    chat_history: &Vec<Message>,
+    tx: std::sync::mpsc::Sender<String>,
+) {
     let host = "api.openai.com";
     let path = "/v1/chat/completions";
     let port = 443;
+
+    // probably optimizable
+    let messages = vec![Message::new(MessageType::System, system_prompt)]
+        .iter()
+        .chain(chat_history.iter())
+        .cloned()
+        .collect::<Vec<Message>>();
+
     let body = serde_json::json!({
         "model": "gpt-4o-mini",
-        "messages": chat_history.iter().map(|message| {
+        "messages": messages.iter().map(|message| {
             serde_json::json!({
                 "role": message.message_type.to_string(),
                 "content": message.content
@@ -109,8 +122,8 @@ pub fn prompt(chat_history: &Vec<Message>, tx: std::sync::mpsc::Sender<String>) 
             let response_json: serde_json::Value = match serde_json::from_str(&payload) {
                 Ok(json) => json,
                 Err(e) => {
-                    log(&format!("JSON parse error: {}", e));
-                    log(&format!("Error payload: {}", payload));
+                    error!("JSON parse error: {}", e);
+                    error!("Error payload: {}", payload);
 
                     serde_json::Value::Null
                 }
