@@ -450,7 +450,7 @@ pub fn terminal_app(system_prompt: String, debug: bool) -> Vec<openai::Message> 
                             let prompt = system_prompt.clone();
                             let tx = tx.clone();
                             std::thread::spawn(move || {
-                                openai::prompt(prompt, &messages, tx);
+                                openai::prompt_stream(prompt, &messages, tx);
                             });
                         }
                     }
@@ -945,9 +945,11 @@ fn chat_submit(state: &mut State) {
     state.push_message(openai::Message::new(openai::MessageType::User, message));
 
     state.input = vec![String::new()];
+
     let origin = input_origin();
     state.input_cursor_position.0 = origin.0;
     state.input_cursor_position.1 = origin.1;
+    state.paging_index = 0;
 
     move_cursor(state.input_cursor_position);
 }
@@ -1028,8 +1030,6 @@ fn input(state: &mut State, c: char, key_modifiers: crossterm::event::KeyModifie
         } else {
             let (col, row) = state.get_input_position();
             let line_number = row as usize + state.paging_index as usize;
-            // TODO: keep finding crashes here--what gives?
-            //       how do i even reproduce this
             if state.input[line_number].len() == window_width() as usize - 1 {
                 state
                     .input
