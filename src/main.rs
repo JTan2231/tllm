@@ -6,12 +6,18 @@ use crate::logger::Logger;
 
 struct Flags {
     generate_name: bool,
+    api: String,
+    adhoc: String,
+    help: bool,
 }
 
 impl Flags {
     fn new() -> Self {
         Self {
             generate_name: true,
+            api: "anthropic".to_string(),
+            adhoc: String::new(),
+            help: false,
         }
     }
 }
@@ -25,20 +31,64 @@ fn create_if_nonexistent(path: &std::path::PathBuf) {
     }
 }
 
-fn parse_flags() -> Flags {
-    let mut flag = Flags::new();
+fn man() {
+    println!("tllm - Terminal LLM");
+    println!("\nUsage: tllm [options]");
+    println!("\nOptions:");
+    println!("\t-n\tDo not generate a name for the conversation");
+    println!("\t-a\tUse the specified API [anthropic, openai]");
+    println!("\t-i\tUse given message for a one-off response");
+    println!("\t-h\tDisplay this help message");
+    println!("\nEnvironment Variables:");
+    println!("\tOPENAI_API_KEY\tAPI key for OpenAI");
+    println!("\tANTHROPIC_API_KEY\tAPI key for Anthropic");
+    println!("\tTLLM_DEBUG\tEnable debug logging (~/.local/tllm/logs)");
+    println!("\nExamples:");
+    println!("\ttllm -n -a openai");
+    println!("\ttllm -a openai -i \"Hello, how are you?\"");
+    println!("\n");
+}
+
+fn parse_flags() -> Result<Flags, Box<dyn std::error::Error>> {
+    let mut flags = Flags::new();
     let args: Vec<String> = std::env::args().collect();
 
     for i in 1..args.len() {
         match args[i].as_str() {
-            "--no-name" => {
-                flag.generate_name = false;
+            "-n" => {
+                flags.generate_name = false;
+            }
+            "-a" => {
+                if i + 1 < args.len() {
+                    flags.api = args[i + 1].clone();
+                } else {
+                    panic!("-a flag requires an argument");
+                }
+            }
+            "-i" => {
+                if i + 1 < args.len() {
+                    flags.adhoc = args[i + 1].clone();
+                } else {
+                    panic!("-i flag requires an argument");
+                }
+            }
+            "-h" => {
+                flags.help = true;
             }
             _ => (),
         }
     }
 
-    flag
+    match flags.api.as_str() {
+        "anthropic" => {}
+        "openai" => {}
+        _ => {
+            error!("Invalid API: {}", flags.api);
+            return Err("Invalid API".into());
+        }
+    }
+
+    Ok(flags)
 }
 
 const NAME_PROMPT: &str = r#"
@@ -91,9 +141,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         system_prompt = sp.trim().to_string();
     }
 
-    let flags = parse_flags();
+    let flags = parse_flags()?;
 
-    if args.len() > 1 {
+    if flags.help {
+        man();
+        return Ok(());
+    }
+
+    match flags.api.as_str() {
+        "anthropic" => match std::env::var("ANTHROPIC_API_KEY") {
+            Ok(_) => (),
+            Err(_) => panic!("ANTHROPIC_API_KEY environment variable not set"),
+        },
+        "openai" => match std::env::var("OPENAI_API_KEY") {
+            Ok(_) => (),
+            Err(_) => panic!("OPENAI_API_KEY environment variable not set"),
+        },
+        _ => {}
+    }
+
+    if flags.adhoc.len() > 0 {
         let mut chat_history = vec![openai::Message::new(
             openai::MessageType::User,
             args[1].clone(),
@@ -109,7 +176,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let destination = conversations_path.join(now.clone());
         let destination = match destination.to_str() {
             Some(s) => format!("{}.json", s),
-            None => panic!(
+            _ => panic!(
                 "Failed to convert path to string: {:?} + {:?}",
                 conversations_path, now
             ),
@@ -129,7 +196,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             debug = !d.is_empty();
         }
 
-        let messages = display::terminal_app(system_prompt.clone(), debug);
+        let messages = display::terminal_app(system_prompt.clone(), flags.api, debug);
 
         if messages.len() > 0 {
             let mut name = now.clone();
@@ -151,7 +218,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let destination = conversations_path.join(name.clone());
             let destination = match destination.to_str() {
                 Some(s) => format!("{}.json", s),
-                None => panic!(
+                _ => panic!(
                     "Failed to convert path to string: {:?} + {:?}",
                     conversations_path, name
                 ),

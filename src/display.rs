@@ -223,23 +223,31 @@ impl State {
         }
     }
 
+    // looks hideous in terms of performance
+    // there must be a better way
     fn push_delta(&mut self, delta: String) {
-        // for some reason these deltas have quotes around them
-        let delta = delta[1..delta.len() - 1].to_string();
-        let mut last_message = self.chat_display.last().unwrap().clone();
-        if last_message.len() + delta.len() >= window_width() as usize - PROMPT.len() - 2 {
-            self.chat_display.push(delta.clone());
-        } else {
-            last_message.push_str(&delta);
-            self.chat_display.pop();
-            self.chat_display.push(last_message);
+        let mut last_message = self.chat_display.pop().unwrap().clone();
+        last_message.push_str(&delta);
+        let new_lines = last_message.split('\n').collect::<Vec<&str>>();
+
+        let mut wrapped_lines = Vec::new();
+        for line in new_lines.iter() {
+            let mut wrapped = vec![line.to_string().clone()];
+            if line.len() > window_width() as usize - PROMPT.len() - 1 as usize {
+                wrapped = wrap(
+                    &line.to_string(),
+                    window_width() as usize - PROMPT.len() as usize,
+                );
+            }
+
+            wrapped_lines.extend(wrapped);
         }
 
-        let chars = delta.chars().collect::<Vec<char>>();
-        let mut i = chars.len() as i16 - 1;
-        while i > -1 && chars[i as usize] == '\n' {
-            self.chat_display.push(String::new());
-            i -= 1;
+        self.chat_display.extend(wrapped_lines);
+
+        if self.chat_display.len() > window_height() as usize - CHAT_BOX_HEIGHT as usize - 1 {
+            self.chat_paging_index =
+                self.chat_display.len() as u16 - (window_height() - CHAT_BOX_HEIGHT - 1);
         }
 
         self.messages.last_mut().unwrap().content.push_str(&delta);
@@ -303,7 +311,7 @@ fn log_state(state: &mut State, c: &str, debug: bool) {
     }
 }
 
-pub fn terminal_app(system_prompt: String, debug: bool) -> Vec<openai::Message> {
+pub fn terminal_app(system_prompt: String, api: String, debug: bool) -> Vec<openai::Message> {
     enable_raw_mode().unwrap();
     execute!(std::io::stdout(), Clear(ClearType::All)).unwrap();
     print!("{}", PROMPT);
@@ -449,12 +457,17 @@ pub fn terminal_app(system_prompt: String, debug: bool) -> Vec<openai::Message> 
                             let messages = state.messages.clone();
                             let prompt = system_prompt.clone();
                             let tx = tx.clone();
-                            std::thread::spawn(move || {
-                                openai::prompt_stream(prompt, &messages, tx);
+                            let api = api.clone();
+                            std::thread::spawn(move || match api.as_str() {
+                                "openai" => openai::prompt_stream(prompt, &messages, tx),
+                                "anthropic" => {
+                                    openai::anthropic_prompt_stream(prompt, &messages, tx)
+                                }
+                                _ => {}
                             });
                         }
                     }
-                    None => {}
+                    _ => {}
                 };
 
                 let mut new_delta = false;
