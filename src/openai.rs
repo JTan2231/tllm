@@ -46,7 +46,6 @@ pub fn prompt(
     let path = "/v1/chat/completions";
     let port = 443;
 
-    // probably optimizable
     let messages = vec![Message::new(MessageType::System, system_prompt.clone())]
         .iter()
         .chain(chat_history.iter())
@@ -321,7 +320,6 @@ pub fn anthropic_prompt_stream(
     let mut reader = std::io::BufReader::new(stream);
     let mut headers = String::new();
     while reader.read_line(&mut headers).unwrap() > 2 {
-        info!("Anthropic headers: {}", headers);
         if headers == "\r\n" {
             break;
         }
@@ -373,6 +371,4 @@ pub fn anthropic_prompt_stream(
 
         event_buffer.clear();
     }
-
-    info!("Anthropic whole message: {}", whole_message);
 }

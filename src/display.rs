@@ -311,7 +311,12 @@ fn log_state(state: &mut State, c: &str, debug: bool) {
     }
 }
 
-pub fn terminal_app(system_prompt: String, api: String, debug: bool) -> Vec<openai::Message> {
+pub fn terminal_app(
+    system_prompt: String,
+    api: String,
+    conversation_path: String,
+    debug: bool,
+) -> Vec<openai::Message> {
     enable_raw_mode().unwrap();
     execute!(std::io::stdout(), Clear(ClearType::All)).unwrap();
     print!("{}", PROMPT);
@@ -332,6 +337,21 @@ pub fn terminal_app(system_prompt: String, api: String, debug: bool) -> Vec<open
         input_cursor_position: (PROMPT.len() as u16, height - CHAT_BOX_HEIGHT),
         highlight_cursor_position: (PROMPT.len() as u16, 0),
     };
+
+    let messages: Vec<openai::Message> = match std::fs::read_to_string(conversation_path.clone()) {
+        Ok(s) => match serde_json::from_str(&s) {
+            Ok(messages) => messages,
+            Err(e) => {
+                error!("Failed to deserialize conversation: {}", e);
+                Vec::new()
+            }
+        },
+        Err(_) => Vec::new(),
+    };
+
+    for message in messages.iter() {
+        state.push_message(message.clone());
+    }
 
     let mut state_queue = state.clone();
 

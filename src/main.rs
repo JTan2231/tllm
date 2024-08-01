@@ -9,15 +9,17 @@ struct Flags {
     api: String,
     adhoc: String,
     help: bool,
+    load_conversation: String,
 }
 
 impl Flags {
     fn new() -> Self {
         Self {
-            generate_name: true,
+            generate_name: false,
             api: "anthropic".to_string(),
             adhoc: String::new(),
             help: false,
+            load_conversation: String::new(),
         }
     }
 }
@@ -56,24 +58,40 @@ fn parse_flags() -> Result<Flags, Box<dyn std::error::Error>> {
     for i in 1..args.len() {
         match args[i].as_str() {
             "-n" => {
-                flags.generate_name = false;
+                flags.generate_name = !flags.generate_name;
             }
             "-a" => {
                 if i + 1 < args.len() {
                     flags.api = args[i + 1].clone();
                 } else {
-                    panic!("-a flag requires an argument");
+                    man();
+                    return Err("API flag -a requires an argument".into());
                 }
             }
             "-i" => {
                 if i + 1 < args.len() {
                     flags.adhoc = args[i + 1].clone();
                 } else {
-                    panic!("-i flag requires an argument");
+                    man();
+                    return Err("API flag -i requires an argument".into());
                 }
             }
             "-h" => {
                 flags.help = true;
+            }
+            "-l" => {
+                if i + 1 < args.len() {
+                    let filepath = std::path::PathBuf::from(args[i + 1].clone());
+                    if !filepath.exists() {
+                        error!("File does not exist: {:?}", filepath);
+                        return Err("File does not exist".into());
+                    }
+
+                    flags.load_conversation = args[i + 1].clone();
+                } else {
+                    man();
+                    return Err("API flag -l requires a filepath argument".into());
+                }
             }
             _ => (),
         }
@@ -94,8 +112,8 @@ fn parse_flags() -> Result<Flags, Box<dyn std::error::Error>> {
 const NAME_PROMPT: &str = r#"
 you will receive as input a conversation.
 respond _only_ with a name for the conversation.
-keep it simple, concise, and precise.
-respond with no more than one line or a phrase.
+respond with no more than 5 words.
+use no punctuation or formatting
 "#;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -196,7 +214,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             debug = !d.is_empty();
         }
 
-        let messages = display::terminal_app(system_prompt.clone(), flags.api, debug);
+        let messages = display::terminal_app(
+            system_prompt.clone(),
+            flags.api,
+            flags.load_conversation.clone(),
+            debug,
+        );
 
         if messages.len() > 0 {
             let mut name = now.clone();
@@ -217,7 +240,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let messages_json = serde_json::to_string(&messages).unwrap();
             let destination = conversations_path.join(name.clone());
             let destination = match destination.to_str() {
-                Some(s) => format!("{}.json", s),
+                Some(s) => {
+                    if flags.load_conversation.len() > 0 {
+                        format!("{}", flags.load_conversation)
+                    } else {
+                        format!("{}.json", s)
+                    }
+                }
                 _ => panic!(
                     "Failed to convert path to string: {:?} + {:?}",
                     conversations_path, name
