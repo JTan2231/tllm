@@ -40,6 +40,7 @@ impl Message {
 }
 
 struct RequestParams {
+    provider: String,
     host: String,
     path: String,
     port: u16,
@@ -52,38 +53,69 @@ struct RequestParams {
 }
 
 fn build_request(params: &RequestParams) -> String {
-    let body = serde_json::json!({
-        "model": params.model,
-        "messages": params.messages.iter().map(|message| {
-            serde_json::json!({
-                "role": message.message_type.to_string(),
-                "content": message.content
-            })
-        }).collect::<Vec<serde_json::Value>>(),
-        "stream": params.stream,
-    });
+    let body = match params.provider.as_str() {
+        "openai" => serde_json::json!({
+            "model": params.model,
+            "messages": params.messages.iter()
+                .map(|message| {
+                    serde_json::json!({
+                        "role": message.message_type.to_string(),
+                        "content": message.content
+                    })
+                }).collect::<Vec<serde_json::Value>>(),
+            "stream": params.stream,
+        }),
+        "anthropic" => serde_json::json!({
+            "model": params.model,
+            "messages": params.messages.iter().map(|message| {
+                serde_json::json!({
+                    "role": message.message_type.to_string(),
+                    "content": message.content
+                })
+            }).collect::<Vec<serde_json::Value>>(),
+            "stream": params.stream,
+            "max_tokens": params.max_tokens.unwrap(),
+            "system": params.system_prompt.clone().unwrap(),
+        }),
+        _ => panic!("Invalid provider for request_body: {}", params.provider),
+    };
 
     let json = serde_json::json!(body);
     let json_string = serde_json::to_string(&json).expect("Failed to serialize JSON");
+
+    let auth_string = match params.provider.as_str() {
+        "openai" => "Authorization: Bearer ".to_string() + &params.authorization_token,
+        "anthropic" => "x-api-key: ".to_string() + &params.authorization_token,
+        _ => panic!("Invalid provider for auth_string: {}", params.provider),
+    };
+
+    let api_version = match params.provider.as_str() {
+        "openai" => "\r\n",
+        "anthropic" => "anthropic-version: 2023-06-01\r\n\r\n",
+        _ => panic!("Invalid provider for api_version: {}", params.provider),
+    };
 
     format!(
         "POST {} HTTP/1.1\r\n\
         Host: {}\r\n\
         Content-Type: application/json\r\n\
         Content-Length: {}\r\n\
-        Authorization: Bearer {}\r\n\
-        Connection: close\r\n\r\n\
+        Accept: */*\r\n\
+        {}\r\n\
+        {}\
         {}",
         params.path,
         params.host,
         json_string.len(),
-        params.authorization_token,
-        json_string
+        auth_string,
+        api_version,
+        json_string.trim()
     )
 }
 
 fn get_openai_request_params(system_prompt: String, chat_history: &Vec<Message>) -> RequestParams {
     RequestParams {
+        provider: "openai".to_string(),
         host: "api.openai.com".to_string(),
         path: "/v1/chat/completions".to_string(),
         port: 443,
@@ -93,7 +125,7 @@ fn get_openai_request_params(system_prompt: String, chat_history: &Vec<Message>)
             .cloned()
             .collect::<Vec<Message>>(),
         model: "gpt-4o-mini".to_string(),
-        stream: false,
+        stream: true,
         authorization_token: env::var("OPENAI_API_KEY")
             .expect("OPENAI_API_KEY environment variable not set"),
         max_tokens: None,
@@ -106,6 +138,7 @@ fn get_anthropic_request_params(
     chat_history: &Vec<Message>,
 ) -> RequestParams {
     RequestParams {
+        provider: "anthropic".to_string(),
         host: "api.anthropic.com".to_string(),
         path: "/v1/messages".to_string(),
         port: 443,
@@ -114,7 +147,7 @@ fn get_anthropic_request_params(
         stream: true,
         authorization_token: env::var("ANTHROPIC_API_KEY")
             .expect("ANTHROPIC_API_KEY environment variable not set"),
-        max_tokens: Some(8192),
+        max_tokens: Some(4096),
         system_prompt: Some(system_prompt),
     }
 }
@@ -123,6 +156,7 @@ fn process_openai_stream(
     stream: TlsStream<TcpStream>,
     tx: &std::sync::mpsc::Sender<String>,
 ) -> Result<String, std::io::Error> {
+    info!("processing openai stream");
     let mut reader = std::io::BufReader::new(stream);
     let mut headers = String::new();
     while reader.read_line(&mut headers).unwrap() > 2 {
@@ -179,6 +213,7 @@ fn process_anthropic_stream(
     stream: TlsStream<TcpStream>,
     tx: &std::sync::mpsc::Sender<String>,
 ) -> Result<String, std::io::Error> {
+    info!("processing anthropic stream");
     let mut reader = std::io::BufReader::new(stream);
     let mut all_headers = Vec::new();
     let mut headers = String::new();
@@ -251,6 +286,7 @@ pub fn prompt_stream(
         .expect("Failed to establish TLS connection");
 
     let request = build_request(&params);
+    info!("sending request {}", request);
     stream
         .write_all(request.as_bytes())
         .expect("Failed to write to stream");

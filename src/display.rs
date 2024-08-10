@@ -483,6 +483,8 @@ pub fn terminal_app(
                                     Ok(_) => {}
                                     Err(e) => {
                                         error!("Error sending message to GPT: {}", e);
+
+                                        std::process::exit(1);
                                     }
                                 }
                             });
