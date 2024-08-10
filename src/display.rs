@@ -7,14 +7,14 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
 };
 
+use crate::api;
 use crate::logger::Logger;
-use crate::openai;
 use crate::{error, info};
 
 const PROMPT: &str = "  ";
 const MESSAGE_SEPARATOR: &str = "───";
 const CHAT_BOX_HEIGHT: u16 = 10;
-const POLL_TIMEOUT: u64 = 25; // ms
+const POLL_TIMEOUT: u64 = 5; // ms
 
 // wraps text around a given width
 // line breaks on spaces
@@ -100,7 +100,7 @@ enum InputMode {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct State {
     input_history: Vec<String>,
-    messages: Vec<openai::Message>,
+    messages: Vec<api::Message>,
     chat_display: Vec<String>,
     input: Vec<String>,
     input_mode: InputMode,
@@ -204,15 +204,15 @@ impl State {
         }
     }
 
-    fn push_message(&mut self, message: openai::Message) {
+    fn push_message(&mut self, message: api::Message) {
         self.messages.push(message.clone());
         let lines = wrap(&message.content, window_width() as usize - PROMPT.len() - 1);
 
-        if message.message_type == openai::MessageType::User {
+        if message.message_type == api::MessageType::User {
             self.chat_display.push(MESSAGE_SEPARATOR.to_string());
         }
         self.chat_display.extend(lines);
-        if message.message_type == openai::MessageType::User {
+        if message.message_type == api::MessageType::User {
             self.chat_display.push(MESSAGE_SEPARATOR.to_string());
         }
 
@@ -316,7 +316,7 @@ pub fn terminal_app(
     api: String,
     conversation_path: String,
     debug: bool,
-) -> Vec<openai::Message> {
+) -> Vec<api::Message> {
     enable_raw_mode().unwrap();
     execute!(std::io::stdout(), Clear(ClearType::All)).unwrap();
     print!("{}", PROMPT);
@@ -338,7 +338,7 @@ pub fn terminal_app(
         highlight_cursor_position: (PROMPT.len() as u16, 0),
     };
 
-    let messages: Vec<openai::Message> = match std::fs::read_to_string(conversation_path.clone()) {
+    let messages: Vec<api::Message> = match std::fs::read_to_string(conversation_path.clone()) {
         Ok(s) => match serde_json::from_str(&s) {
             Ok(messages) => messages,
             Err(e) => {
@@ -468,9 +468,9 @@ pub fn terminal_app(
                 // do we have a pending message for gpt?
                 match state.messages.last() {
                     Some(last_message) => {
-                        if last_message.message_type == openai::MessageType::User {
-                            state_queue.push_message(openai::Message::new(
-                                openai::MessageType::Assistant,
+                        if last_message.message_type == api::MessageType::User {
+                            state_queue.push_message(api::Message::new(
+                                api::MessageType::Assistant,
                                 String::new(),
                             ));
 
@@ -478,12 +478,13 @@ pub fn terminal_app(
                             let prompt = system_prompt.clone();
                             let tx = tx.clone();
                             let api = api.clone();
-                            std::thread::spawn(move || match api.as_str() {
-                                "openai" => openai::prompt_stream(prompt, &messages, tx),
-                                "anthropic" => {
-                                    openai::anthropic_prompt_stream(prompt, &messages, tx)
+                            std::thread::spawn(move || {
+                                match api::prompt_stream(prompt, &messages, &api, tx) {
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        error!("Error sending message to GPT: {}", e);
+                                    }
                                 }
-                                _ => {}
                             });
                         }
                     }
@@ -975,7 +976,7 @@ fn cursor_to_block() {
 
 fn chat_submit(state: &mut State) {
     let message = state.input.join("\n").trim().to_string();
-    state.push_message(openai::Message::new(openai::MessageType::User, message));
+    state.push_message(api::Message::new(api::MessageType::User, message));
 
     state.input = vec![String::new()];
 

@@ -1,6 +1,6 @@
+mod api;
 mod display;
 mod logger;
-mod openai;
 
 use crate::logger::Logger;
 
@@ -33,23 +33,7 @@ fn create_if_nonexistent(path: &std::path::PathBuf) {
     }
 }
 
-fn man() {
-    println!("tllm - Terminal LLM");
-    println!("\nUsage: tllm [options]");
-    println!("\nOptions:");
-    println!("\t-n\tDo not generate a name for the conversation");
-    println!("\t-a\tUse the specified API [anthropic, openai]");
-    println!("\t-i\tUse given message for a one-off response");
-    println!("\t-h\tDisplay this help message");
-    println!("\nEnvironment Variables:");
-    println!("\tOPENAI_API_KEY\tAPI key for OpenAI");
-    println!("\tANTHROPIC_API_KEY\tAPI key for Anthropic");
-    println!("\tTLLM_DEBUG\tEnable debug logging (~/.local/tllm/logs)");
-    println!("\nExamples:");
-    println!("\ttllm -n -a openai");
-    println!("\ttllm -a openai -i \"Hello, how are you?\"");
-    println!("\n");
-}
+fn man() {}
 
 fn parse_flags() -> Result<Flags, Box<dyn std::error::Error>> {
     let mut flags = Flags::new();
@@ -179,12 +163,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if flags.adhoc.len() > 0 {
-        let mut chat_history = vec![openai::Message::new(
-            openai::MessageType::User,
-            args[1].clone(),
-        )];
+        let mut chat_history = vec![api::Message::new(api::MessageType::User, args[1].clone())];
 
-        let response = openai::prompt(&system_prompt, &chat_history)?;
+        let response = api::prompt(&system_prompt, &chat_history)?;
 
         println!("\n\n{}\n\n", response.content);
 
@@ -225,7 +206,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut name = now.clone();
             if flags.generate_name {
                 println!("Generating name...");
-                match openai::prompt(&NAME_PROMPT.to_string(), &messages) {
+                match api::prompt(&NAME_PROMPT.to_string(), &messages) {
                     Ok(response) => {
                         name = response.content.clone();
                         name = name.replace(" ", "_").to_lowercase();
