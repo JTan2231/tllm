@@ -2,7 +2,7 @@ use std::io::Write;
 use std::sync::Once;
 
 pub struct Logger {
-    filename: String,
+    file: std::fs::File,
 }
 
 static mut INSTANCE: Option<Logger> = None;
@@ -12,7 +12,13 @@ impl Logger {
     pub fn init(filename: String) -> &'static Logger {
         unsafe {
             INIT.call_once(|| {
-                INSTANCE = Some(Logger { filename });
+                INSTANCE = Some(Logger {
+                    file: std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(filename)
+                        .expect("Failed to open log file"),
+                });
             });
 
             INSTANCE.as_ref().unwrap()
@@ -26,14 +32,14 @@ impl Logger {
                 panic!("Logger not initialized");
             }
 
-            let filename = INSTANCE.as_ref().unwrap().filename.clone();
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(filename)
-                .expect("Failed to open log file");
+            let mut file = INSTANCE
+                .as_ref()
+                .unwrap()
+                .file
+                .try_clone()
+                .expect("Failed to clone file");
 
-            let message = format!("{} [INFO]: {}\n", chrono::Local::now(), message);
+            let message = format!("{} [INFO]: {}", chrono::Local::now(), message);
             writeln!(file, "{}", message).expect("Failed to write to log file");
         }
     }
@@ -44,14 +50,14 @@ impl Logger {
                 panic!("Logger not initialized");
             }
 
-            let filename = INSTANCE.as_ref().unwrap().filename.clone();
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(filename)
-                .expect("Failed to open log file");
+            let mut file = INSTANCE
+                .as_ref()
+                .unwrap()
+                .file
+                .try_clone()
+                .expect("Failed to clone file");
 
-            let message = format!("{} [ERROR]: {}\n", chrono::Local::now(), message);
+            let message = format!("{} [ERROR]: {}", chrono::Local::now(), message);
             writeln!(file, "{}", message).expect("Failed to write to log file");
         }
     }
@@ -69,4 +75,16 @@ macro_rules! error {
     ($($arg:tt)*) => {
         Logger::error(format!($($arg)*));
     }
+}
+
+#[macro_export]
+macro_rules! printl {
+    (info, $($arg:tt)*) => {
+        println!("{}", format!($($arg)*));
+        Logger::info(format!($($arg)*));
+    };
+    (error, $($arg:tt)*) => {
+        println!("{}", format!($($arg)*));
+        Logger::error(format!($($arg)*));
+    };
 }

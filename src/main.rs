@@ -9,6 +9,7 @@ struct Flags {
     api: String,
     adhoc: String,
     help: bool,
+    system_prompt: String,
     load_conversation: String,
 }
 
@@ -19,6 +20,7 @@ impl Flags {
             api: "anthropic".to_string(),
             adhoc: String::new(),
             help: false,
+            system_prompt: String::new(),
             load_conversation: String::new(),
         }
     }
@@ -33,7 +35,16 @@ fn create_if_nonexistent(path: &std::path::PathBuf) {
     }
 }
 
-fn man() {}
+fn man() {
+    println!("Usage: tllm [OPTIONS] [TEXT]");
+    println!("\nOptions:");
+    println!("\t-n\t\tDo not generate a name for the conversation file");
+    println!("\t-a API\t\tUse the specified API (anthropic, openai)");
+    println!("\t-i TEXT\t\tUse the specified text as an ad-hoc prompt");
+    println!("\t-h\t\tDisplay this help message");
+    println!("\t-l FILE\t\tLoad a conversation from the specified file");
+    println!("\t-s TEXT or FILE\t\tUse the specified text/file as the system prompt");
+}
 
 fn parse_flags() -> Result<Flags, Box<dyn std::error::Error>> {
     let mut flags = Flags::new();
@@ -77,6 +88,14 @@ fn parse_flags() -> Result<Flags, Box<dyn std::error::Error>> {
                     return Err("API flag -l requires a filepath argument".into());
                 }
             }
+            "-s" => {
+                if i + 1 < args.len() {
+                    flags.system_prompt = args[i + 1].clone();
+                } else {
+                    man();
+                    return Err("API flag -s requires an argument".into());
+                }
+            }
             _ => (),
         }
     }
@@ -92,13 +111,6 @@ fn parse_flags() -> Result<Flags, Box<dyn std::error::Error>> {
 
     Ok(flags)
 }
-
-const NAME_PROMPT: &str = r#"
-you will receive as input a conversation.
-respond _only_ with a name for the conversation.
-respond with no more than 5 words.
-use no punctuation or formatting
-"#;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let now: String = chrono::Local::now().timestamp_micros().to_string();
@@ -124,11 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let conversations_path = local_path.join("conversations");
     let logging_path = local_path.join("logs");
-    logger::Logger::init(format!(
-        "{}/{}.log",
-        logging_path.to_str().unwrap(),
-        now.clone()
-    ));
+    logger::Logger::init(format!("{}/debug.log", logging_path.to_str().unwrap()));
 
     create_if_nonexistent(&local_path);
     create_if_nonexistent(&config_path);
@@ -136,14 +144,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     create_if_nonexistent(&conversations_path);
     create_if_nonexistent(&logging_path);
 
-    let args: Vec<String> = std::env::args().collect();
-
-    let mut system_prompt = String::new();
-    if let Ok(sp) = std::fs::read_to_string(config_path.join("system_prompt")) {
-        system_prompt = sp.trim().to_string();
-    }
-
     let flags = parse_flags()?;
+
+    let system_prompt = match flags.system_prompt.len() {
+        0 => {
+            let system_prompt_path = config_path.join("system_prompt");
+            if system_prompt_path.exists() {
+                match std::fs::read_to_string(system_prompt_path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("Failed to read system prompt: {}", e);
+                        String::new()
+                    }
+                }
+            } else {
+                String::new()
+            }
+        }
+        _ => {
+            let system_prompt_path = std::path::PathBuf::from(flags.system_prompt.clone());
+            if system_prompt_path.exists() {
+                match std::fs::read_to_string(system_prompt_path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("Failed to read system prompt: {}", e);
+                        String::new()
+                    }
+                }
+            } else {
+                flags.system_prompt.clone()
+            }
+        }
+    };
 
     if flags.help {
         man();
@@ -163,11 +195,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if flags.adhoc.len() > 0 {
-        let mut chat_history = vec![api::Message::new(api::MessageType::User, args[1].clone())];
+        let mut chat_history = vec![api::Message::new(
+            api::MessageType::User,
+            flags.adhoc.clone(),
+        )];
 
-        let response = api::prompt(&system_prompt, &chat_history)?;
+        let response = api::prompt(&flags.api, &system_prompt, &chat_history)?;
+        let content = response.content.replace("\\n", "\n");
 
-        println!("\n\n{}\n\n", response.content);
+        println!("{}\n\n", content);
 
         chat_history.push(response);
 
@@ -183,10 +219,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         match std::fs::write(destination.clone(), messages_json) {
             Ok(_) => {
-                println!("Conversation saved to {}", destination);
+                info!("Conversation saved to {}", destination);
             }
             Err(e) => {
-                println!("Error saving messages: {}", e);
+                info!("Error saving messages: {}", e);
             }
         }
     } else {
@@ -203,21 +239,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         if messages.len() > 0 {
-            let mut name = now.clone();
-            if flags.generate_name {
-                println!("Generating name...");
-                match api::prompt(&NAME_PROMPT.to_string(), &messages) {
-                    Ok(response) => {
-                        name = response.content.clone();
-                        name = name.replace(" ", "_").to_lowercase();
-                    }
-                    Err(e) => {
-                        error!("Failed to generate name: {}", e);
-                        error!("Conversation: {:?}", messages);
-                    }
-                }
-            }
-
+            let name = now.clone();
             let messages_json = serde_json::to_string(&messages).unwrap();
             let destination = conversations_path.join(name.clone());
             let destination = match destination.to_str() {
@@ -236,10 +258,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match std::fs::write(destination.clone(), messages_json) {
                 Ok(_) => {
-                    println!("Conversation saved to {}", destination);
+                    info!("Conversation saved to {}", destination);
                 }
                 Err(e) => {
-                    println!("Error saving messages: {}", e);
+                    info!("Error saving messages: {}", e);
                 }
             }
         }

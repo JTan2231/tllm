@@ -39,6 +39,7 @@ impl Message {
     }
 }
 
+#[derive(Clone, Debug)]
 struct RequestParams {
     provider: String,
     host: String,
@@ -113,7 +114,11 @@ fn build_request(params: &RequestParams) -> String {
     )
 }
 
-fn get_openai_request_params(system_prompt: String, chat_history: &Vec<Message>) -> RequestParams {
+fn get_openai_request_params(
+    system_prompt: String,
+    chat_history: &Vec<Message>,
+    stream: bool,
+) -> RequestParams {
     RequestParams {
         provider: "openai".to_string(),
         host: "api.openai.com".to_string(),
@@ -125,7 +130,7 @@ fn get_openai_request_params(system_prompt: String, chat_history: &Vec<Message>)
             .cloned()
             .collect::<Vec<Message>>(),
         model: "gpt-4o-mini".to_string(),
-        stream: true,
+        stream,
         authorization_token: env::var("OPENAI_API_KEY")
             .expect("OPENAI_API_KEY environment variable not set"),
         max_tokens: None,
@@ -136,6 +141,7 @@ fn get_openai_request_params(system_prompt: String, chat_history: &Vec<Message>)
 fn get_anthropic_request_params(
     system_prompt: String,
     chat_history: &Vec<Message>,
+    stream: bool,
 ) -> RequestParams {
     RequestParams {
         provider: "anthropic".to_string(),
@@ -144,7 +150,7 @@ fn get_anthropic_request_params(
         port: 443,
         messages: chat_history.iter().cloned().collect::<Vec<Message>>(),
         model: "claude-3-5-sonnet-20240620".to_string(),
-        stream: true,
+        stream,
         authorization_token: env::var("ANTHROPIC_API_KEY")
             .expect("ANTHROPIC_API_KEY environment variable not set"),
         max_tokens: Some(4096),
@@ -273,8 +279,8 @@ pub fn prompt_stream(
     tx: std::sync::mpsc::Sender<String>,
 ) -> Result<(), std::io::Error> {
     let params = match api.as_str() {
-        "anthropic" => get_anthropic_request_params(system_prompt.clone(), chat_history),
-        "openai" => get_openai_request_params(system_prompt.clone(), chat_history),
+        "anthropic" => get_anthropic_request_params(system_prompt.clone(), chat_history, true),
+        "openai" => get_openai_request_params(system_prompt.clone(), chat_history, true),
         _ => panic!("Invalid API: {}--how'd this get here?", api),
     };
 
@@ -312,73 +318,69 @@ pub fn prompt_stream(
 }
 
 pub fn prompt(
+    api: &String,
     system_prompt: &String,
     chat_history: &Vec<Message>,
 ) -> Result<Message, std::io::Error> {
-    let host = "api.openai.com";
-    let path = "/v1/chat/completions";
-    let port = 443;
+    let params = match api.as_str() {
+        "anthropic" => get_anthropic_request_params(system_prompt.clone(), chat_history, false),
+        "openai" => get_openai_request_params(system_prompt.clone(), chat_history, false),
+        _ => panic!("Invalid API: {}--how'd this get here?", api),
+    };
 
-    let messages = vec![Message::new(MessageType::System, system_prompt.clone())]
-        .iter()
-        .chain(chat_history.iter())
-        .cloned()
-        .collect::<Vec<Message>>();
+    info!("Using params: {:?}", params);
 
-    let body = serde_json::json!({
-        "model": "gpt-4o-mini",
-        "messages": messages.iter().map(|message| {
-            serde_json::json!({
-                "role": message.message_type.to_string(),
-                "content": message.content
-            })
-        }).collect::<Vec<serde_json::Value>>(),
-    });
+    info!("Connecting to {}:{}", params.host, params.port);
 
-    let json = serde_json::json!(body);
-    let json_string = serde_json::to_string(&json).expect("Failed to serialize JSON");
-
-    let authorization_token =
-        env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY environment variable not set");
-
-    let request = format!(
-        "POST {} HTTP/1.1\r\n\
-        Host: {}\r\n\
-        Content-Type: application/json\r\n\
-        Content-Length: {}\r\n\
-        Authorization: Bearer {}\r\n\
-        Connection: close\r\n\r\n\
-        {}",
-        path,
-        host,
-        json_string.len(),
-        authorization_token,
-        json_string
-    );
-
-    let stream = TcpStream::connect((host, port))?;
+    let stream = TcpStream::connect((params.host.clone(), params.port))?;
 
     let connector = native_tls::TlsConnector::new().expect("Failed to create TLS connector");
     let mut stream = connector
-        .connect(host, stream)
+        .connect(&params.host, stream)
         .expect("Failed to establish TLS connection");
 
+    info!("TLS connection established");
+
+    let request = build_request(&params);
     stream.write_all(request.as_bytes())?;
     stream.flush()?;
 
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .expect("Failed to read from stream");
+    info!("Request sent: {}", request);
 
-    let parts = response.split("\r\n\r\n").collect::<Vec<&str>>();
-    let headers = parts[0];
-    let response_body = parts[1];
-    let mut remaining = response_body;
+    let mut reader = std::io::BufReader::new(stream);
+    let mut content_length = 0;
+    let mut headers = Vec::new();
+    let mut line = String::new();
+    while reader.read_line(&mut line).unwrap() > 0 {
+        info!("Header: {}", line);
+        if line == "\r\n" {
+            info!("End of headers");
+            break;
+        }
+
+        if line.contains("Content-Length") {
+            let parts: Vec<&str> = line.split(":").collect();
+            content_length = parts[1].trim().parse().unwrap();
+        }
+
+        headers.push(line.clone());
+        line.clear();
+    }
+
+    info!("Headers: {:?}", headers);
+
+    let mut response_body = String::new();
+    reader
+        .take(content_length as u64)
+        .read_to_string(&mut response_body)?;
+
+    info!("Response body: {}", response_body);
+
+    let mut remaining = response_body.as_str();
     let mut decoded_body = String::new();
 
     // they like to use this transfer encoding for long responses
-    if headers.contains("Transfer-Encoding: chunked") {
+    if headers.contains(&"Transfer-Encoding: chunked".to_string()) {
         while !remaining.is_empty() {
             if let Some(index) = remaining.find("\r\n") {
                 let (size_str, rest) = remaining.split_at(index);
@@ -411,9 +413,14 @@ pub fn prompt(
     }
 
     let response_json: serde_json::Value = response_json.unwrap();
-    let mut content = response_json["choices"][0]["message"]["content"].to_string();
+
+    let mut content = match api.as_str() {
+        "openai" => response_json["choices"][0]["message"]["content"].to_string(),
+        "anthropic" => response_json["content"][0]["text"].to_string(),
+        _ => String::new(),
+    };
+
     content = content
-        .replace("\\n", "\n")
         .replace("\\\"", "\"")
         .replace("\\'", "'")
         .replace("\\\\", "\\");

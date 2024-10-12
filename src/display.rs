@@ -1016,18 +1016,25 @@ fn get_clipboard_text() -> String {
     ctx.get_contents().unwrap()
 }
 
+// the return signifies whether the program should continue running
 fn input(state: &mut State, c: char, key_modifiers: crossterm::event::KeyModifiers) -> bool {
     if state.input_mode == InputMode::Command {
+        if c == 'q' {
+            return false;
+        }
+
         if c == 'a' {
             state.input_mode = InputMode::Edit;
             cursor_to_line();
             move_cursor(state.input_cursor_position);
-
-            return true;
         }
 
-        if c == 'q' {
-            return false;
+        if c == 'y' {
+            let (col, row) = state.get_chat_position();
+            let line_number = row as usize + state.chat_paging_index as usize;
+            let message = state.messages[line_number].content.clone();
+            let mut ctx = ClipboardContext::new().unwrap();
+            ctx.set_contents(message).unwrap();
         }
     } else {
         if c == 'v' && key_modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
