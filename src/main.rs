@@ -1,573 +1,272 @@
 mod api;
+mod display;
 mod logger;
-
-use copypasta::{ClipboardContext, ClipboardProvider};
-
-use ratatui::{
-    crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    layout::{Constraint, Layout, Position, Rect},
-    style::{Color, Style},
-    widgets::{Block, Paragraph},
-};
 
 use crate::logger::Logger;
 
-#[derive(Eq, PartialEq)]
-enum InputMode {
-    Normal,
-    Insert,
-}
-
-#[derive(Debug)]
-struct WrappedText {
-    content: String,
-    line_lengths: Vec<usize>,
-    page: usize,
-    window_size: (usize, usize),
-}
-
-impl WrappedText {
-    fn is_byte_boundary(&self, offset: usize) -> bool {
-        offset == 0
-            || offset == self.content.len()
-            || (self.content.as_bytes()[offset] & 0xC0) != 0x80
-    }
-
-    fn find_prev_byte_boundary(&self, mut offset: usize) -> usize {
-        while offset > 0 && !self.is_byte_boundary(offset) {
-            offset -= 1;
-        }
-
-        offset
-    }
-
-    fn find_next_byte_boundary(&self, mut offset: usize) -> usize {
-        while offset < self.content.len() && !self.is_byte_boundary(offset) {
-            offset += 1;
-        }
-
-        offset
-    }
-
-    fn get_flat(&self, line: usize, mut offset: usize, previous_byte_boundary: bool) -> usize {
-        for l in 0..line {
-            offset += self.line_lengths[l];
-        }
-
-        if previous_byte_boundary {
-            self.find_prev_byte_boundary(offset)
-        } else {
-            self.find_next_byte_boundary(offset)
-        }
-    }
-
-    pub fn insert(&mut self, substring: &str, line: usize, column: usize) {
-        let offset = self.get_flat(line, column + 1, false);
-
-        if offset >= self.content.len() {
-            self.content.push_str(substring);
-        } else {
-            self.content.insert_str(offset, substring);
-        }
-    }
-
-    // clamping for these two paging functions is done in the main render loop
-    // with setting cursor.row >= window_height as the requirement for triggering it
-    // done in the KeyEvent handling down below
-
-    pub fn page_up(&mut self) {
-        if self.page >= self.window_size.1 {
-            self.page -= self.window_size.1;
-        } else {
-            self.page = 0;
-        }
-    }
-
-    pub fn page_down(&mut self) {
-        self.page += self.window_size.1;
-    }
-
-    pub fn delete_word(&mut self, line: usize, column: usize) -> String {
-        let mut end = self.get_flat(line, column, true);
-        if end == 0 {
-            return String::new();
-        }
-
-        if column < self.line_lengths[line] {
-            end += 1;
-        }
-
-        let mut begin = end - 1;
-        let bytes = self.content.as_bytes();
-        while begin > 0 && (!self.is_byte_boundary(begin) || !bytes[begin].is_ascii_whitespace()) {
-            begin -= 1;
-        }
-
-        self.content.drain(begin..end).as_str().to_string()
-    }
-
-    pub fn display(&self) -> &str {
-        if self.line_lengths.len() == 0 {
-            return "";
-        }
-
-        let mut begin = 0;
-        for p in 0..self.page {
-            begin += self.line_lengths[p];
-        }
-
-        let mut end = begin;
-        for p in self.page..self.line_lengths.len() {
-            end += self.line_lengths[p];
-        }
-
-        begin = self.find_prev_byte_boundary(begin);
-        end = self.find_next_byte_boundary(end);
-
-        &self.content[begin..end].trim()
-    }
-
-    pub fn len(&self) -> usize {
-        self.content.len()
-    }
-
-    pub fn clear(&mut self) {
-        self.content = String::new();
-        self.line_lengths = Vec::new();
-    }
-}
-
-struct State {
-    input_wrapped: WrappedText,
-    chat_wrapped: WrappedText,
-    input_mode: InputMode,
-    pending_changes: bool,
+struct Flags {
+    generate_name: bool,
+    api: String,
+    adhoc: String,
+    help: bool,
     system_prompt: String,
-    chat_messages: Vec<api::Message>,
-    input_cursor: (usize, usize),
-    chat_cursor: (usize, usize),
-    pending_page_up: bool,
-    pending_chat_update: String,
-    pending_deletions: usize,
+    load_conversation: String,
 }
 
-// there's probably a better abstraction for these interactive boxes
-impl State {
-    pub fn rewrap(&mut self, window: Rect) {
-        let new_wrapped = match self.input_mode {
-            InputMode::Normal => &mut self.chat_wrapped,
-            InputMode::Insert => &mut self.input_wrapped,
-        };
-
-        let mut wrapped_content = String::new();
-        let mut lengths = Vec::new();
-        let mut column: usize = 0;
-        for c in new_wrapped.content.chars() {
-            if c == '\n' || column as u16 >= window.width - 2 {
-                wrapped_content.push('\n');
-                lengths.push(column as usize);
-                column = 0;
-            }
-
-            if c != '\n' {
-                wrapped_content.push(c);
-            }
-
-            column += c.len_utf8();
+impl Flags {
+    fn new() -> Self {
+        Self {
+            generate_name: false,
+            api: "anthropic".to_string(),
+            adhoc: String::new(),
+            help: false,
+            system_prompt: String::new(),
+            load_conversation: String::new(),
         }
-
-        lengths.push(column);
-        new_wrapped.line_lengths = lengths;
-        new_wrapped.content = wrapped_content;
     }
+}
 
-    // the output clamped cursor of this should refer to
-    // the bounds of the container in which it resides
-    pub fn clamp_cursor(&mut self) {
-        let (cursor, wrapped) = match self.input_mode {
-            InputMode::Normal => (&mut self.chat_cursor, &self.chat_wrapped),
-            InputMode::Insert => (&mut self.input_cursor, &self.input_wrapped),
+fn create_if_nonexistent(path: &std::path::PathBuf) {
+    if !path.exists() {
+        match std::fs::create_dir_all(&path) {
+            Ok(_) => (),
+            Err(e) => panic!("Failed to create directory: {:?}, {}", path, e),
         };
+    }
+}
 
-        if wrapped.line_lengths.len() == 0 {
-            *cursor = (0, 0);
-            return;
-        }
+fn man() {
+    println!("Usage: tllm [OPTIONS] [TEXT]");
+    println!("\nOptions:");
+    println!("\t-n\t\tDo not generate a name for the conversation file");
+    println!("\t-a API\t\tUse the specified API (anthropic, openai)");
+    println!("\t-i TEXT\t\tUse the specified text as an ad-hoc prompt");
+    println!("\t-h\t\tDisplay this help message");
+    println!("\t-l FILE\t\tLoad a conversation from the specified file");
+    println!("\t-s TEXT or FILE\t\tUse the specified text/file as the system prompt");
+}
 
-        let new_row = std::cmp::min(cursor.0, wrapped.line_lengths.len() - 1);
-        let new_row = std::cmp::min(new_row, wrapped.window_size.1 - 2);
-        let line_index = new_row + wrapped.page;
-        let col_bound = if wrapped.line_lengths[line_index] > 0 {
-            wrapped.line_lengths[line_index]
-                - (if cursor.0 > 0 && self.input_mode == InputMode::Insert {
-                    1
+fn parse_flags() -> Result<Flags, Box<dyn std::error::Error>> {
+    let mut flags = Flags::new();
+    let args: Vec<String> = std::env::args().collect();
+
+    for i in 1..args.len() {
+        match args[i].as_str() {
+            "-n" => {
+                flags.generate_name = !flags.generate_name;
+            }
+            "-a" => {
+                if i + 1 < args.len() {
+                    flags.api = args[i + 1].clone();
                 } else {
-                    0
-                })
-        } else {
-            0
-        };
+                    man();
+                    return Err("API flag -a requires an argument".into());
+                }
+            }
+            "-i" => {
+                if i + 1 < args.len() {
+                    flags.adhoc = args[i + 1].clone();
+                } else {
+                    man();
+                    return Err("API flag -i requires an argument".into());
+                }
+            }
+            "-h" => {
+                flags.help = true;
+            }
+            "-l" => {
+                if i + 1 < args.len() {
+                    let filepath = std::path::PathBuf::from(args[i + 1].clone());
+                    if !filepath.exists() {
+                        error!("File does not exist: {:?}", filepath);
+                        return Err("File does not exist".into());
+                    }
 
-        cursor.0 = new_row;
-        cursor.1 = std::cmp::min(std::cmp::max(cursor.1, 0), col_bound);
+                    flags.load_conversation = args[i + 1].clone();
+                } else {
+                    man();
+                    return Err("API flag -l requires a filepath argument".into());
+                }
+            }
+            "-s" => {
+                if i + 1 < args.len() {
+                    flags.system_prompt = args[i + 1].clone();
+                } else {
+                    man();
+                    return Err("API flag -s requires an argument".into());
+                }
+            }
+            _ => (),
+        }
     }
+
+    match flags.api.as_str() {
+        "anthropic" => {}
+        "openai" => {}
+        _ => {
+            error!("Invalid API: {}", flags.api);
+            return Err("Invalid API".into());
+        }
+    }
+
+    Ok(flags)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    Logger::init("/home/joey/.local/tllm/logs/debug.log".to_string());
-    let mut terminal = ratatui::init();
+    let now: String = chrono::Local::now().timestamp_micros().to_string();
 
-    let mut state = State {
-        input_wrapped: WrappedText {
-            content: String::new(),
-            line_lengths: Vec::new(),
-            page: 0,
-            window_size: (0, 0),
-        },
-        chat_wrapped: WrappedText {
-            content: String::new(),
-            line_lengths: Vec::new(),
-            page: 0,
-            window_size: (0, 0),
-        },
-        system_prompt: String::new(),
-        chat_messages: Vec::new(),
-        pending_changes: false,
-        input_mode: InputMode::Normal,
-        input_cursor: (0, 0),
-        chat_cursor: (0, 0),
-        pending_page_up: false,
-        pending_chat_update: String::new(),
-        pending_deletions: 0,
+    match std::env::var("OPENAI_API_KEY") {
+        Ok(_) => (),
+        Err(_) => panic!("OPENAI_API_KEY environment variable not set"),
+    }
+
+    let home_dir = match std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .or_else(|_| {
+            std::env::var("HOMEDRIVE").and_then(|homedrive| {
+                std::env::var("HOMEPATH").map(|homepath| format!("{}{}", homedrive, homepath))
+            })
+        }) {
+        Ok(dir) => std::path::PathBuf::from(dir),
+        Err(_) => panic!("Failed to get home directory"),
     };
 
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let local_path = home_dir.join(".local/tllm");
+    let config_path = home_dir.join(".config/tllm");
 
-    loop {
-        terminal.draw(|frame| {
-            let [chat_box, input_box, status_bar] = Layout::vertical([
-                Constraint::Percentage(66),
-                Constraint::Min(3),
-                Constraint::Max(1),
-            ])
-            .areas(frame.area());
+    let conversations_path = local_path.join("conversations");
+    let logging_path = local_path.join("logs");
+    logger::Logger::init(format!("{}/debug.log", logging_path.to_str().unwrap()));
 
-            if state.pending_changes {
-                state.rewrap(input_box);
-                state.pending_changes = false;
-            }
+    create_if_nonexistent(&local_path);
+    create_if_nonexistent(&config_path);
 
-            state.chat_wrapped.window_size = (chat_box.width.into(), chat_box.height.into());
-            state.input_wrapped.window_size = (input_box.width.into(), input_box.height.into());
+    create_if_nonexistent(&conversations_path);
+    create_if_nonexistent(&logging_path);
 
-            {
-                let (cursor, page_check) = match state.input_mode {
-                    InputMode::Normal => (&mut state.chat_cursor, &mut state.chat_wrapped),
-                    InputMode::Insert => (&mut state.input_cursor, &mut state.input_wrapped),
-                };
+    let flags = parse_flags()?;
 
-                if cursor.0 >= page_check.window_size.1 - 2 {
-                    let diff = cursor.0 - (page_check.window_size.1 - 2) + 1;
-                    page_check.page = std::cmp::min(
-                        page_check.page + diff,
-                        page_check.line_lengths.len() - (page_check.window_size.1 - 2),
-                    );
-                    cursor.0 = page_check.window_size.1 - 3;
-                } else if cursor.0 == 0 && state.pending_page_up && page_check.page > 0 {
-                    page_check.page -= 1;
-                }
-
-                state.pending_page_up = false;
-            }
-
-            if state.pending_chat_update.len() > 0 {
-                state
-                    .chat_wrapped
-                    .content
-                    .push_str(&state.pending_chat_update);
-                state.rewrap(chat_box);
-                state.pending_chat_update = String::new();
-            }
-
-            // if we have pending deletions, the cursors should already be valid
-            if state.pending_deletions > 0 {
-                info!(
-                    "calling delete with cursor: {:?} on {:?}",
-                    (
-                        state.input_cursor.0 + state.input_wrapped.page,
-                        state.input_cursor.1,
-                    ),
-                    state.input_wrapped
-                );
-                let offset = state.input_wrapped.get_flat(
-                    state.input_cursor.0 + state.input_wrapped.page,
-                    state.input_cursor.1 + (if state.input_cursor.0 > 0 { 1 } else { 0 }),
-                    true,
-                );
-
-                if offset < state.pending_deletions {
-                    state.pending_deletions = offset;
-                }
-
-                if state.pending_deletions > 0 {
-                    let lower = std::cmp::max(offset - state.pending_deletions, 0);
-                    let upper = offset;
-
-                    let deleted = state.input_wrapped.content.drain(lower..upper);
-                    // setting it to the max width
-                    // with the assumption that it'll be placed within bounds on the next clamp
-                    if deleted.as_str() == "\n" {
-                        state.input_cursor.1 = input_box.width as usize;
-                        if state.input_wrapped.page > 0 {
-                            state.input_wrapped.page -= 1;
-                        }
+    let system_prompt = match flags.system_prompt.len() {
+        0 => {
+            let system_prompt_path = config_path.join("system_prompt");
+            if system_prompt_path.exists() {
+                match std::fs::read_to_string(system_prompt_path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("Failed to read system prompt: {}", e);
+                        String::new()
                     }
-
-                    drop(deleted);
-
-                    state.pending_deletions = 0;
-                    state.rewrap(input_box);
                 }
+            } else {
+                String::new()
             }
-
-            state.clamp_cursor();
-
-            // the cursor should always be clamped before reaching here
-            let (display_cursor, focused_area) = match state.input_mode {
-                InputMode::Normal => (state.chat_cursor, chat_box),
-                InputMode::Insert => (state.input_cursor, input_box),
-            };
-
-            frame.render_widget(
-                Paragraph::new(state.chat_wrapped.display()).block(Block::bordered().title("Chat")),
-                chat_box,
-            );
-
-            frame.render_widget(
-                Paragraph::new(state.input_wrapped.display())
-                    .block(Block::bordered().title("Input")),
-                input_box,
-            );
-
-            frame.render_widget(
-                Paragraph::new(match state.input_mode {
-                    InputMode::Insert => "Insert",
-                    InputMode::Normal => "Command",
-                })
-                .style(Style::default().fg(Color::Black).bg(
-                    match state.input_mode {
-                        InputMode::Insert => Color::LightYellow,
-                        InputMode::Normal => Color::LightCyan,
-                    },
-                )),
-                status_bar,
-            );
-
-            frame.set_cursor_position(Position::new(
-                focused_area.x + display_cursor.1 as u16 + 1,
-                focused_area.y + display_cursor.0 as u16 + 1,
-            ));
-        })?;
-
-        match rx.try_recv() {
-            Ok(message) => {
-                let last_message = state.chat_messages.last_mut().unwrap();
-                last_message.content.push_str(&message.clone());
-
-                state.pending_chat_update = message;
-                state.chat_cursor.0 = state.chat_wrapped.line_lengths.len();
+        }
+        _ => {
+            let system_prompt_path = std::path::PathBuf::from(flags.system_prompt.clone());
+            if system_prompt_path.exists() {
+                match std::fs::read_to_string(system_prompt_path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("Failed to read system prompt: {}", e);
+                        String::new()
+                    }
+                }
+            } else {
+                flags.system_prompt.clone()
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            Err(e) => panic!("{}", e),
+        }
+    };
+
+    if flags.help {
+        man();
+        return Ok(());
+    }
+
+    match flags.api.as_str() {
+        "anthropic" => match std::env::var("ANTHROPIC_API_KEY") {
+            Ok(_) => (),
+            Err(_) => panic!("ANTHROPIC_API_KEY environment variable not set"),
+        },
+        "openai" => match std::env::var("OPENAI_API_KEY") {
+            Ok(_) => (),
+            Err(_) => panic!("OPENAI_API_KEY environment variable not set"),
+        },
+        _ => {}
+    }
+
+    if flags.adhoc.len() > 0 {
+        let mut chat_history = vec![api::Message::new(
+            api::MessageType::User,
+            flags.adhoc.clone(),
+        )];
+
+        let response = api::prompt(&flags.api, &system_prompt, &chat_history)?;
+        let content = response.content.replace("\\n", "\n");
+
+        println!("{}\n\n", content);
+
+        chat_history.push(response);
+
+        let messages_json = serde_json::to_string(&chat_history).unwrap();
+        let destination = conversations_path.join(now.clone());
+        let destination = match destination.to_str() {
+            Some(s) => format!("{}.json", s),
+            _ => panic!(
+                "Failed to convert path to string: {:?} + {:?}",
+                conversations_path, now
+            ),
         };
 
-        if event::poll(std::time::Duration::from_millis(25))? {
-            match event::read() {
-                Ok(Event::Key(key)) => {
-                    if key.kind == KeyEventKind::Press {
-                        if state.input_mode == InputMode::Normal {
-                            match key.code {
-                                KeyCode::Tab => {
-                                    info!("{:?}", state.input_wrapped);
-                                }
-                                KeyCode::Char('q') => {
-                                    break;
-                                }
-                                KeyCode::Char('i') | KeyCode::Char('a') => {
-                                    state.input_mode = InputMode::Insert;
-                                }
-                                KeyCode::Enter => {
-                                    if state.input_wrapped.len() > 0 {
-                                        state.chat_messages.push(api::Message {
-                                            message_type: api::MessageType::User,
-                                            content: state.input_wrapped.content.clone(),
-                                        });
+        match std::fs::write(destination.clone(), messages_json) {
+            Ok(_) => {
+                info!("Conversation saved to {}", destination);
+            }
+            Err(e) => {
+                info!("Error saving messages: {}", e);
+            }
+        }
+    } else {
+        let conversation = match std::path::Path::new(&flags.load_conversation.clone()).exists() {
+            true => {
+                let contents = std::fs::read_to_string(flags.load_conversation.clone())?;
+                serde_json::from_str(&contents)?
+            }
+            false => Vec::new(),
+        };
 
-                                        state.pending_chat_update =
-                                            (if state.chat_messages.len() > 1 {
-                                                "\n───\n".to_string()
-                                            } else {
-                                                "".to_string()
-                                            }) + &state.input_wrapped.content.clone()
-                                                + "\n───\n";
+        let messages = match display::display(&system_prompt, &flags.api, &conversation) {
+            Ok(m) => m,
+            Err(_) => panic!("what happened"),
+        };
 
-                                        let messages = state.chat_messages.clone();
-                                        let prompt = state.system_prompt.clone();
-                                        let tx = tx.clone();
-                                        std::thread::spawn(move || {
-                                            match api::prompt_stream(
-                                                prompt,
-                                                &messages,
-                                                &"anthropic".to_string(),
-                                                tx,
-                                            ) {
-                                                Ok(_) => {}
-                                                Err(e) => {
-                                                    error!(
-                                                        "error sending message to GPT endpoint: {}",
-                                                        e
-                                                    );
-                                                    std::process::exit(1);
-                                                }
-                                            }
-                                        });
-                                    }
-
-                                    state.input_wrapped.clear();
-                                }
-                                KeyCode::Left => {
-                                    // underflow
-                                    if state.chat_cursor.1 > 0 {
-                                        state.chat_cursor.1 -= 1;
-                                    }
-                                }
-                                KeyCode::Right => {
-                                    state.chat_cursor.1 += 1;
-                                }
-                                KeyCode::Up => {
-                                    if key.modifiers.contains(KeyModifiers::SHIFT) {
-                                        state.chat_wrapped.page_up();
-                                    } else {
-                                        // underflow
-                                        if state.chat_cursor.0 > 0 {
-                                            state.chat_cursor.0 -= 1;
-                                        } else {
-                                            state.pending_page_up = true;
-                                        }
-                                    }
-                                }
-                                KeyCode::Down => {
-                                    if key.modifiers.contains(KeyModifiers::SHIFT) {
-                                        state.chat_wrapped.page_down();
-                                        state.chat_cursor.0 = state.chat_wrapped.window_size.1;
-                                    } else {
-                                        state.chat_cursor.0 += 1;
-                                    }
-                                }
-                                _ => {}
-                            }
-                        } else if state.input_mode == InputMode::Insert {
-                            match key.code {
-                                KeyCode::Esc => {
-                                    state.input_mode = InputMode::Normal;
-                                }
-                                KeyCode::Char(c) => {
-                                    if key.modifiers.contains(KeyModifiers::CONTROL) {
-                                        match c {
-                                            'w' => {
-                                                let deleted = state.input_wrapped.delete_word(
-                                                    state.input_cursor.0,
-                                                    state.input_cursor.1,
-                                                );
-
-                                                if deleted.contains('\n') {
-                                                    state.input_cursor.1 =
-                                                        state.input_wrapped.window_size.0;
-                                                }
-                                            }
-                                            'v' => {
-                                                let mut ctx = ClipboardContext::new().unwrap();
-                                                let clip_contents = ctx.get_contents().unwrap();
-
-                                                let lines = clip_contents
-                                                    .chars()
-                                                    .filter(|c| *c == '\n')
-                                                    .count();
-
-                                                state.input_wrapped.insert(
-                                                    &clip_contents,
-                                                    state.input_cursor.0 + state.input_wrapped.page,
-                                                    state.input_cursor.1,
-                                                );
-
-                                                state.input_cursor.0 += lines;
-                                                state.input_cursor.1 =
-                                                    state.input_wrapped.window_size.0;
-                                            }
-                                            _ => {}
-                                        }
-                                    } else {
-                                        state.input_wrapped.insert(
-                                            &c.to_string(),
-                                            state.input_cursor.0 + state.input_wrapped.page,
-                                            state.input_cursor.1,
-                                        );
-
-                                        state.input_cursor.1 += 1;
-                                    }
-
-                                    state.pending_changes = true;
-                                }
-                                KeyCode::Enter => {
-                                    state.input_wrapped.insert(
-                                        &'\n'.to_string(),
-                                        state.input_cursor.0 + state.input_wrapped.page,
-                                        state.input_cursor.1,
-                                    );
-
-                                    state.input_cursor.0 += 1;
-                                    state.input_cursor.1 = 0;
-                                    state.pending_changes = true;
-                                }
-                                KeyCode::Backspace => {
-                                    if state.input_wrapped.len() > 0 {
-                                        state.pending_deletions += 1;
-                                    }
-                                }
-                                KeyCode::Left => {
-                                    // underflow
-                                    if state.input_cursor.1 > 0 {
-                                        state.input_cursor.1 -= 1;
-                                    }
-                                }
-                                KeyCode::Right => {
-                                    state.input_cursor.1 += 1;
-                                }
-                                KeyCode::Up => {
-                                    // underflow
-                                    if state.input_cursor.0 > 0 {
-                                        state.input_cursor.0 -= 1;
-                                    } else {
-                                        state.pending_page_up = true;
-                                    }
-                                }
-                                KeyCode::Down => {
-                                    state.input_cursor.0 += 1;
-                                }
-                                _ => {}
-                            }
-                        }
+        if messages.len() > 0 {
+            let name = now.clone();
+            let messages_json = serde_json::to_string(&messages).unwrap();
+            let destination = conversations_path.join(name.clone());
+            let destination = match destination.to_str() {
+                Some(s) => {
+                    if flags.load_conversation.len() > 0 {
+                        format!("{}", flags.load_conversation)
+                    } else {
+                        format!("{}.json", s)
                     }
                 }
-                Err(e) => {
-                    panic!("error reading event: {}", e);
+                _ => panic!(
+                    "Failed to convert path to string: {:?} + {:?}",
+                    conversations_path, name
+                ),
+            };
+
+            match std::fs::write(destination.clone(), messages_json) {
+                Ok(_) => {
+                    info!("Conversation saved to {}", destination);
                 }
-                _ => {}
+                Err(e) => {
+                    info!("Error saving messages: {}", e);
+                }
             }
         }
     }
-
-    ratatui::restore();
 
     Ok(())
 }

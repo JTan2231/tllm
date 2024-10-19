@@ -275,7 +275,7 @@ fn process_anthropic_stream(
 pub fn prompt_stream(
     system_prompt: String,
     chat_history: &Vec<Message>,
-    api: &String,
+    api: String,
     tx: std::sync::mpsc::Sender<String>,
 ) -> Result<(), std::io::Error> {
     let params = match api.as_str() {

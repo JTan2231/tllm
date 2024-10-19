@@ -1,1115 +1,577 @@
 use copypasta::{ClipboardContext, ClipboardProvider};
-use std::io::Write;
 
-use crossterm::{
-    event::{self, Event, KeyCode},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
+use ratatui::{
+    crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    layout::{Constraint, Layout, Position, Rect},
+    style::{Color, Style},
+    widgets::{Block, Paragraph},
 };
 
-use crate::api;
 use crate::logger::Logger;
-use crate::{error, info};
+use crate::{api, error, info};
 
-const PROMPT: &str = "  ";
-const MESSAGE_SEPARATOR: &str = "───";
-const CHAT_BOX_HEIGHT: u16 = 10;
-const POLL_TIMEOUT: u64 = 5; // ms
-
-// wraps text around a given width
-// line breaks on spaces
-pub fn wrap(text: &String, width: usize) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut current_line = String::new();
-    let chars = text.chars().collect::<Vec<char>>();
-
-    let mut i = 0;
-    while i < chars.len() {
-        // for repeated newlines
-        // feels hacky
-        if chars[i] == '\n' {
-            lines.push(current_line);
-            current_line = String::new();
-            i += 1;
-            continue;
-        }
-
-        let mut newline = false;
-        let mut j = i + 1;
-        // retrieve the next word
-        while j < chars.len() {
-            if chars[j] == ' ' {
-                break;
-            }
-
-            if chars[j] == '\n' {
-                newline = true;
-                break;
-            }
-
-            j += 1;
-        }
-
-        if newline {
-            current_line.push_str(&chars[i..j].iter().collect::<String>());
-            lines.push(current_line);
-            current_line = String::new();
-            i = j + 1;
-            continue;
-        }
-
-        let word = &chars[i..j].iter().collect::<String>();
-        if current_line.len() + j - i > width {
-            lines.push(current_line);
-            current_line = String::from(word.to_string());
-        } else {
-            current_line.push_str(word);
-        }
-
-        i += std::cmp::max(1, j - i);
-    }
-
-    lines.push(current_line);
-    lines
-}
-
-// TODO: I think there's a lot of work to be done
-//       on standardizing the way different
-//       coordinate planes/origins are handled
-//
-// TODO: error handling in this file is laughable
-//       maybe replace all the raw indexing with `.get()`?
-//
-// TODO: need a better way of dealing with
-//       the different coordinate planes--it's getting confusing
-//       differentiating between input + chat display
-//       (pending refactor)
-//       ..
-//       should we just define a bunch of different common getters?
-//       and include transformations in each?
-//       and assume outside functions just deal with coordinates
-//       without a basis?
-//       much to ponder
-
-#[derive(PartialEq, Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Eq, PartialEq)]
 enum InputMode {
-    Edit,
-    Command,
+    Normal,
+    Insert,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-struct State {
-    input_history: Vec<String>,
-    messages: Vec<api::Message>,
-    chat_display: Vec<String>,
-    input: Vec<String>,
-    input_mode: InputMode,
-    paging_index: u16,
-    chat_paging_index: u16,
-    // these 2 are (x, y) coordinates
-    // and will _always_ be relative to the terminal window
-    //
-    // NOTE: these should _never_ be in the margins
-    //       e.g., (col < PROMPT.len()) should always be false
-    input_cursor_position: (u16, u16),
-    highlight_cursor_position: (u16, u16),
+#[derive(Debug)]
+struct WrappedText {
+    content: String,
+    line_lengths: Vec<usize>,
+    page: usize,
+    window_size: (usize, usize),
 }
 
-// NOTE: all of these currently only account for the input paging index
-//       really, the chat_paging index et al. should be accounted for
-//       in an entirely different struct
-
-impl State {
-    // changing origin from terminal window to input box
-    // this is still relative to the terminal window,
-    // just with the origin shifted to account for padding
-    // and whatnot
-    //
-    // as such it can be used for, e.g., indexing the characters on a line
-    // (i think)
-    //
-    // this _DOES NOT_ adjust for paging
-    fn get_input_position(&self) -> (u16, u16) {
-        let origin = input_origin();
-
-        (
-            self.input_cursor_position.0 - origin.0,
-            self.input_cursor_position.1 - origin.1,
-        )
+impl WrappedText {
+    fn is_byte_boundary(&self, offset: usize) -> bool {
+        offset == 0
+            || offset == self.content.len()
+            || (self.content.as_bytes()[offset] & 0xC0) != 0x80
     }
 
-    // mostly just for consistency with get_input_position
-    //
-    // this is still relative to the terminal window,
-    // just with the origin shifted to account for padding
-    // and whatnot
-    //
-    // as such it can be used for, e.g., indexing the characters on a line
-    // (i think)
-    //
-    // this _DOES NOT_ adjust for paging
-    fn get_chat_position(&self) -> (u16, u16) {
-        (
-            self.highlight_cursor_position.0 - PROMPT.len() as u16,
-            self.highlight_cursor_position.1,
-        )
-    }
-
-    // mapping from the cursor's position on the screen
-    // to the index of the string it's on
-    fn cursor_position_to_string_position(&self, position: (u16, u16)) -> (u16, u16) {
-        match self.input_mode {
-            InputMode::Edit => {
-                let row = position.1 + self.paging_index;
-                let col = std::cmp::max(position.0, PROMPT.len() as u16) - PROMPT.len() as u16;
-
-                (col, row)
-            }
-            InputMode::Command => {
-                let row = position.1 + self.chat_paging_index;
-                let col = std::cmp::max(position.0, PROMPT.len() as u16) - PROMPT.len() as u16;
-
-                (col, row)
-            }
+    fn find_prev_byte_boundary(&self, mut offset: usize) -> usize {
+        while offset > 0 && !self.is_byte_boundary(offset) {
+            offset -= 1;
         }
+
+        offset
     }
 
-    fn get_current_line(&self) -> String {
-        match self.input_mode {
-            InputMode::Edit => {
-                self.input[(self.paging_index + self.get_input_position().1) as usize].clone()
-            }
-            InputMode::Command => self.chat_display
-                [(self.chat_paging_index + self.get_chat_position().1) as usize]
-                .clone(),
+    fn find_next_byte_boundary(&self, mut offset: usize) -> usize {
+        while offset < self.content.len() && !self.is_byte_boundary(offset) {
+            offset += 1;
         }
+
+        offset
     }
 
-    fn get_current_line_length(&self) -> usize {
-        let line = self.get_current_line();
-        if line == MESSAGE_SEPARATOR {
-            3
+    fn get_flat(&self, line: usize, mut offset: usize, previous_byte_boundary: bool) -> usize {
+        for l in 0..line {
+            offset += self.line_lengths[l];
+        }
+
+        if previous_byte_boundary {
+            self.find_prev_byte_boundary(offset)
         } else {
-            line.len()
+            self.find_next_byte_boundary(offset)
         }
     }
 
-    // horrific function name
-    // this is a mutable reference to the cursor position
-    // depending on the current input mode
-    fn get_mut_mode_position(&mut self) -> &mut (u16, u16) {
-        match self.input_mode {
-            InputMode::Edit => &mut self.input_cursor_position,
-            InputMode::Command => &mut self.highlight_cursor_position,
+    pub fn insert(&mut self, substring: &str, line: usize, column: usize) {
+        let offset = self.get_flat(line, column + 1, false);
+
+        if offset >= self.content.len() {
+            self.content.push_str(substring);
+        } else {
+            self.content.insert_str(offset, substring);
         }
     }
 
-    fn push_message(&mut self, message: api::Message) {
-        self.messages.push(message.clone());
-        let lines = wrap(&message.content, window_width() as usize - PROMPT.len() - 1);
+    // clamping for these two paging functions is done in the main render loop
+    // with setting cursor.row >= window_height as the requirement for triggering it
+    // done in the KeyEvent handling down below
 
-        if message.message_type == api::MessageType::User {
-            self.chat_display.push(MESSAGE_SEPARATOR.to_string());
-        }
-        self.chat_display.extend(lines);
-        if message.message_type == api::MessageType::User {
-            self.chat_display.push(MESSAGE_SEPARATOR.to_string());
-        }
-
-        // move to the bottom on updates
-        if self.chat_display.len() > window_height() as usize - CHAT_BOX_HEIGHT as usize - 2 {
-            self.chat_paging_index =
-                self.chat_display.len() as u16 - (window_height() - CHAT_BOX_HEIGHT - 2);
+    pub fn page_up(&mut self) {
+        if self.page >= self.window_size.1 {
+            self.page -= self.window_size.1;
+        } else {
+            self.page = 0;
         }
     }
 
-    // looks hideous in terms of performance
-    // there must be a better way
-    fn push_delta(&mut self, delta: String) {
-        let mut last_message = self.chat_display.pop().unwrap().clone();
-        last_message.push_str(&delta);
-        let new_lines = last_message.split('\n').collect::<Vec<&str>>();
-
-        let mut wrapped_lines = Vec::new();
-        for line in new_lines.iter() {
-            let mut wrapped = vec![line.to_string().clone()];
-            if line.len() > window_width() as usize - PROMPT.len() - 1 as usize {
-                wrapped = wrap(
-                    &line.to_string(),
-                    window_width() as usize - PROMPT.len() as usize,
-                );
-            }
-
-            wrapped_lines.extend(wrapped);
-        }
-
-        self.chat_display.extend(wrapped_lines);
-
-        if self.chat_display.len() > window_height() as usize - CHAT_BOX_HEIGHT as usize - 1 {
-            self.chat_paging_index =
-                self.chat_display.len() as u16 - (window_height() - CHAT_BOX_HEIGHT - 1);
-        }
-
-        self.messages.last_mut().unwrap().content.push_str(&delta);
+    pub fn page_down(&mut self) {
+        self.page += self.window_size.1;
     }
 
-    // indices based on a (0, 0) origin
-    // mapped to their respective origins
-    // dependent on input mode
-    fn map_index_and_move(&mut self, col: u16, row: u16) {
-        let mut col = col;
-        let mut row = row;
-        match self.input_mode {
-            InputMode::Edit => {
-                let origin = input_origin();
-                col += origin.0;
-                row += origin.1;
-
-                self.input_cursor_position.0 = col as u16;
-                self.input_cursor_position.1 = row as u16;
-
-                self.input_cursor_position.0 = clamp(
-                    self.input_cursor_position.0,
-                    self.get_current_line_length() as u16,
-                );
-
-                move_cursor(self.input_cursor_position);
-            }
-            InputMode::Command => {
-                self.highlight_cursor_position.0 = col + PROMPT.len() as u16;
-                self.highlight_cursor_position.1 = row as u16;
-
-                self.highlight_cursor_position.0 = clamp(
-                    self.highlight_cursor_position.0,
-                    self.get_current_line_length() as u16,
-                );
-
-                move_cursor(self.highlight_cursor_position);
-            }
+    pub fn delete_word(&mut self, line: usize, column: usize) -> String {
+        let mut end = self.get_flat(line, column, true);
+        if end == 0 {
+            return String::new();
         }
+
+        if column < self.line_lengths[line] {
+            end += 1;
+        }
+
+        let mut begin = end - 1;
+        let bytes = self.content.as_bytes();
+        while begin > 0 && (!self.is_byte_boundary(begin) || !bytes[begin].is_ascii_whitespace()) {
+            begin -= 1;
+        }
+
+        self.content.drain(begin..end).as_str().to_string()
+    }
+
+    pub fn display(&self) -> &str {
+        if self.line_lengths.len() == 0 {
+            return "";
+        }
+
+        let mut begin = 0;
+        for p in 0..self.page {
+            begin += self.line_lengths[p];
+        }
+
+        let mut end = begin;
+        for p in self.page..self.line_lengths.len() {
+            end += self.line_lengths[p];
+        }
+
+        begin = self.find_prev_byte_boundary(begin);
+        end = self.find_next_byte_boundary(end);
+
+        &self.content[begin..end].trim()
+    }
+
+    pub fn len(&self) -> usize {
+        self.content.len()
+    }
+
+    pub fn clear(&mut self) {
+        self.content = String::new();
+        self.line_lengths = Vec::new();
     }
 }
 
-fn cleanup(message: String) {
-    move_cursor((0, 0));
-    execute!(std::io::stdout(), Clear(ClearType::All)).unwrap();
-    disable_raw_mode().unwrap();
-
-    println!("{}", message);
-    cursor_to_block();
+struct State {
+    input_wrapped: WrappedText,
+    chat_wrapped: WrappedText,
+    input_mode: InputMode,
+    pending_changes: bool,
+    chat_messages: Vec<api::Message>,
+    input_cursor: (usize, usize),
+    chat_cursor: (usize, usize),
+    pending_page_up: bool,
+    pending_chat_update: String,
+    pending_deletions: usize,
 }
 
-fn log_state(state: &mut State, c: &str, debug: bool) {
-    state.input_history.push(format!("Char('{}')", c));
-    if debug {
-        info!("{}", serde_json::to_string_pretty(&state).unwrap());
-        info!(
-            "mapped positions: {:?}, {:?}",
-            state.get_input_position(),
-            state.get_chat_position()
-        );
+// there's probably a better abstraction for these interactive boxes
+impl State {
+    pub fn rewrap(&mut self, window: Rect) {
+        let new_wrapped = match self.input_mode {
+            InputMode::Normal => &mut self.chat_wrapped,
+            InputMode::Insert => &mut self.input_wrapped,
+        };
+
+        let mut wrapped_content = String::new();
+        let mut lengths = Vec::new();
+        let mut column: usize = 0;
+        for c in new_wrapped.content.chars() {
+            if c == '\n' || column as u16 >= window.width - 2 {
+                wrapped_content.push('\n');
+                lengths.push(column as usize);
+                column = 0;
+            }
+
+            if c != '\n' {
+                wrapped_content.push(c);
+            }
+
+            column += c.len_utf8();
+        }
+
+        lengths.push(column);
+        new_wrapped.line_lengths = lengths;
+        new_wrapped.content = wrapped_content;
+    }
+
+    // the output clamped cursor of this should refer to
+    // the bounds of the container in which it resides
+    pub fn clamp_cursor(&mut self) {
+        let (cursor, wrapped) = match self.input_mode {
+            InputMode::Normal => (&mut self.chat_cursor, &self.chat_wrapped),
+            InputMode::Insert => (&mut self.input_cursor, &self.input_wrapped),
+        };
+
+        if wrapped.line_lengths.len() == 0 {
+            *cursor = (0, 0);
+            return;
+        }
+
+        let new_row = std::cmp::min(cursor.0, wrapped.line_lengths.len() - 1);
+        let new_row = std::cmp::min(new_row, wrapped.window_size.1 - 2);
+        let line_index = new_row + wrapped.page;
+        let col_bound = if wrapped.line_lengths[line_index] > 0 {
+            wrapped.line_lengths[line_index]
+                - (if cursor.0 > 0 && self.input_mode == InputMode::Insert {
+                    1
+                } else {
+                    0
+                })
+        } else {
+            0
+        };
+
+        cursor.0 = new_row;
+        cursor.1 = std::cmp::min(std::cmp::max(cursor.1, 0), col_bound);
     }
 }
 
-pub fn terminal_app(
-    system_prompt: String,
-    api: String,
-    conversation_path: String,
-    debug: bool,
-) -> Vec<api::Message> {
-    enable_raw_mode().unwrap();
-    execute!(std::io::stdout(), Clear(ClearType::All)).unwrap();
-    print!("{}", PROMPT);
-    std::io::stdout().flush().unwrap();
-
-    let mut init = true;
-
-    let height = crossterm::terminal::size().unwrap().1;
+pub fn display(
+    system_prompt: &str,
+    api: &str,
+    conversation: &Vec<api::Message>,
+) -> Result<Vec<api::Message>, Box<dyn std::error::Error>> {
+    let mut terminal = ratatui::init();
 
     let mut state = State {
-        input_history: Vec::new(),
-        messages: Vec::new(),
-        chat_display: Vec::new(),
-        input: Vec::from([String::new()]),
-        input_mode: InputMode::Command,
-        paging_index: 0,
-        chat_paging_index: 0,
-        input_cursor_position: (PROMPT.len() as u16, height - CHAT_BOX_HEIGHT),
-        highlight_cursor_position: (PROMPT.len() as u16, 0),
-    };
-
-    let messages: Vec<api::Message> = match std::fs::read_to_string(conversation_path.clone()) {
-        Ok(s) => match serde_json::from_str(&s) {
-            Ok(messages) => messages,
-            Err(e) => {
-                error!("Failed to deserialize conversation: {}", e);
-                Vec::new()
-            }
+        input_wrapped: WrappedText {
+            content: String::new(),
+            line_lengths: Vec::new(),
+            page: 0,
+            window_size: (0, 0),
         },
-        Err(_) => Vec::new(),
+        chat_wrapped: WrappedText {
+            content: String::new(),
+            line_lengths: Vec::new(),
+            page: 0,
+            window_size: (0, 0),
+        },
+        chat_messages: conversation.clone(),
+        pending_changes: false,
+        input_mode: InputMode::Normal,
+        input_cursor: (0, 0),
+        chat_cursor: (0, 0),
+        pending_page_up: false,
+        pending_chat_update: String::new(),
+        pending_deletions: 0,
     };
 
-    for message in messages.iter() {
-        state.push_message(message.clone());
+    for (i, chat) in state.chat_messages.iter().enumerate() {
+        if i > 0 {
+            state.pending_chat_update.push_str("\n───\n");
+        }
+
+        state.pending_chat_update.push_str(&chat.content);
+        state.pending_chat_update.push_str("\n───\n");
     }
 
-    let mut state_queue = state.clone();
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
 
-    std::panic::set_hook(Box::new(|panic_info| {
-        error!("{}", panic_info);
-        cleanup("An error occurred!".to_string());
-    }));
+    loop {
+        terminal.draw(|frame| {
+            let [chat_box, input_box, status_bar] = Layout::vertical([
+                Constraint::Percentage(66),
+                Constraint::Min(3),
+                Constraint::Max(1),
+            ])
+            .areas(frame.area());
 
-    let (tx, rx) = std::sync::mpsc::channel();
+            if state.pending_changes {
+                state.rewrap(input_box);
+                state.pending_changes = false;
+            }
 
-    let mut running = true;
-    while running {
-        match event::poll(std::time::Duration::from_millis(POLL_TIMEOUT)) {
-            Ok(true) => match event::read() {
-                Ok(Event::Key(key_event)) => match key_event.code {
-                    KeyCode::Enter => {
-                        log_state(&mut state_queue, "Enter", debug);
-                        // KeyModifiers don't work on Enter??
-                        /*if key_event
-                            .modifiers
-                            .contains(crossterm::event::KeyModifiers::CONTROL)
-                        {*/
-                        if state.input_mode == InputMode::Command && state.input.len() > 0 {
-                            chat_submit(&mut state_queue);
-                        } else {
-                            running = enter(&mut state_queue);
-                        }
-                    }
+            state.chat_wrapped.window_size = (chat_box.width.into(), chat_box.height.into());
+            state.input_wrapped.window_size = (input_box.width.into(), input_box.height.into());
 
-                    // why does this take so long?
-                    KeyCode::Esc => {
-                        log_state(&mut state_queue, "Esc", debug);
-                        state_queue.input_mode = InputMode::Command;
-                        cursor_to_block();
-                        move_cursor(state_queue.highlight_cursor_position);
-                    }
-
-                    KeyCode::Left => {
-                        log_state(&mut state_queue, "Left", debug);
-                        if key_event
-                            .modifiers
-                            .contains(crossterm::event::KeyModifiers::CONTROL)
-                        {
-                            let (col, row) = previous_word(&mut state_queue);
-                            state_queue.map_index_and_move(col, row);
-                        } else {
-                            left(state_queue.get_mut_mode_position(), PROMPT.len() as u16);
-                        }
-                    }
-
-                    KeyCode::Right => {
-                        log_state(&mut state_queue, "Right", debug);
-                        if key_event
-                            .modifiers
-                            .contains(crossterm::event::KeyModifiers::CONTROL)
-                        {
-                            let (col, row) = next_word(&mut state_queue);
-                            state_queue.map_index_and_move(col, row);
-                        } else {
-                            right(
-                                state_queue.get_mut_mode_position(),
-                                state.get_current_line_length() as u16 + PROMPT.len() as u16,
-                            );
-                        }
-                    }
-
-                    KeyCode::Up => {
-                        log_state(&mut state_queue, "Up", debug);
-                        if key_event
-                            .modifiers
-                            .contains(crossterm::event::KeyModifiers::SHIFT)
-                        {
-                            page_up(&mut state_queue);
-                        } else {
-                            up(&mut state_queue);
-                        }
-                    }
-
-                    KeyCode::Down => {
-                        log_state(&mut state_queue, "Down", debug);
-                        if key_event
-                            .modifiers
-                            .contains(crossterm::event::KeyModifiers::SHIFT)
-                        {
-                            page_down(&mut state_queue);
-                        } else {
-                            down(&mut state_queue);
-                        }
-                    }
-
-                    KeyCode::Backspace => {
-                        log_state(&mut state_queue, "Backspace", debug);
-                        if key_event
-                            .modifiers
-                            .contains(crossterm::event::KeyModifiers::CONTROL)
-                        {
-                        } else {
-                            backspace(&mut state_queue);
-                        }
-                    }
-
-                    KeyCode::Char(c) => {
-                        log_state(&mut state_queue, &c.to_string(), debug);
-                        running = input(&mut state_queue, c, key_event.modifiers);
-                    }
-                    _ => {}
-                },
-                Err(e) => {
-                    panic!("Error reading event: {}", e);
-                }
-                _ => {}
-            },
-            Ok(false) => {
-                // do we have a pending message for gpt?
-                match state.messages.last() {
-                    Some(last_message) => {
-                        if last_message.message_type == api::MessageType::User {
-                            state_queue.push_message(api::Message::new(
-                                api::MessageType::Assistant,
-                                String::new(),
-                            ));
-
-                            let messages = state.messages.clone();
-                            let prompt = system_prompt.clone();
-                            let tx = tx.clone();
-                            let api = api.clone();
-                            std::thread::spawn(move || {
-                                match api::prompt_stream(prompt, &messages, &api, tx) {
-                                    Ok(_) => {}
-                                    Err(e) => {
-                                        error!("Error sending message to GPT: {}", e);
-
-                                        std::process::exit(1);
-                                    }
-                                }
-                            });
-                        }
-                    }
-                    _ => {}
+            {
+                let (cursor, page_check) = match state.input_mode {
+                    InputMode::Normal => (&mut state.chat_cursor, &mut state.chat_wrapped),
+                    InputMode::Insert => (&mut state.input_cursor, &mut state.input_wrapped),
                 };
 
-                let mut new_delta = false;
-                if let Ok(delta) = rx.try_recv() {
-                    new_delta = true;
-                    state_queue.push_delta(delta);
-                }
-
-                draw(
-                    &state_queue,
-                    state.messages.len() != state_queue.messages.len()
-                        || init
-                        || state.chat_paging_index != state_queue.chat_paging_index
-                        || new_delta,
-                    state.input != state_queue.input
-                        || init
-                        || state.paging_index != state_queue.paging_index,
-                );
-
-                // is this worth optimizing?
-                state = state_queue.clone();
-                init = false;
-            }
-            Err(e) => {
-                panic!("Error polling events: {}", e);
-            }
-        }
-    }
-
-    cleanup("Goodbye!".to_string());
-
-    state.messages
-}
-
-fn draw_lines(lines: &[String], current_row: u16) {
-    move_cursor((PROMPT.len() as u16, current_row));
-    let mut current_row = current_row;
-    for line in lines.iter() {
-        execute!(std::io::stdout(), Clear(ClearType::CurrentLine)).unwrap();
-        let display_line = if line.ends_with('\n') {
-            line[0..line.len() - 1 as usize].to_string()
-        } else {
-            line.clone()
-        };
-        print!("{}", display_line);
-        current_row += 1;
-        move_cursor((PROMPT.len() as u16, current_row));
-    }
-}
-
-fn get_current_view(lines: &Vec<String>, paging_index: usize, height: usize) -> &[String] {
-    if lines.len() > height {
-        &lines[paging_index..std::cmp::min(paging_index + height, lines.len())]
-    } else {
-        &lines
-    }
-}
-
-fn draw(state: &State, redraw_messages: bool, redraw_input: bool) {
-    move_cursor((0, 0));
-
-    if redraw_messages {
-        execute!(std::io::stdout(), Clear(ClearType::All)).unwrap();
-
-        // minus 1 for the separator
-        let message_box_height =
-            (crossterm::terminal::size().unwrap().1 - CHAT_BOX_HEIGHT - 1) as usize;
-        let mut message_lines = state.chat_display.clone();
-        while message_lines.len() < message_box_height {
-            message_lines.push("".to_string());
-        }
-
-        let display_lines = get_current_view(
-            &message_lines,
-            state.chat_paging_index as usize,
-            message_box_height,
-        );
-
-        draw_lines(display_lines, 0);
-
-        move_cursor((
-            PROMPT.len() as u16,
-            crossterm::terminal::size().unwrap().1 - CHAT_BOX_HEIGHT - 1,
-        ));
-        print!("──────");
-    }
-
-    let current_row = crossterm::terminal::size().unwrap().1 - CHAT_BOX_HEIGHT;
-    move_cursor((PROMPT.len() as u16, current_row));
-
-    if redraw_input {
-        execute!(std::io::stdout(), Clear(ClearType::CurrentLine)).unwrap();
-        let lines = get_current_view(
-            &state.input,
-            state.paging_index as usize,
-            CHAT_BOX_HEIGHT as usize,
-        );
-        draw_lines(lines, current_row);
-    }
-
-    if state.input_mode == InputMode::Edit {
-        cursor_to_line();
-        move_cursor(state.input_cursor_position);
-    } else {
-        cursor_to_block();
-        move_cursor(state.highlight_cursor_position);
-    }
-}
-
-fn input_origin() -> (u16, u16) {
-    (
-        PROMPT.len() as u16,
-        crossterm::terminal::size().unwrap().1 - CHAT_BOX_HEIGHT,
-    )
-}
-
-pub fn window_width() -> u16 {
-    crossterm::terminal::size().unwrap().0
-}
-
-fn window_height() -> u16 {
-    crossterm::terminal::size().unwrap().1
-}
-
-fn move_cursor(position: (u16, u16)) {
-    execute!(
-        std::io::stdout(),
-        crossterm::cursor::MoveTo(position.0, position.1)
-    )
-    .unwrap();
-}
-
-// ideally, this is used every time the cursor is moved
-fn clamp(col: u16, line_length: u16) -> u16 {
-    return std::cmp::max(std::cmp::min(col, line_length), PROMPT.len() as u16);
-}
-
-fn left(position: &mut (u16, u16), bound: u16) {
-    if position.0 > bound {
-        position.0 -= 1;
-        move_cursor(*position);
-    }
-}
-
-fn right(position: &mut (u16, u16), bound: u16) {
-    if position.0 < bound {
-        position.0 += 1;
-        move_cursor(*position);
-    }
-}
-
-// delicious wet code
-//
-// i'm sure there are much better ways to structure the code around here
-// but unfortunately i am an inexperienced, filthy individual
-//
-// updates the state's cursor position (input_mode dependent)
-// to find the next word
-fn next_word(state: &mut State) -> (u16, u16) {
-    let (pos, mut paging_index, row_bound, paging_index_bound, display_lines) =
-        match state.input_mode {
-            InputMode::Edit => {
-                let pos = state.get_input_position();
-                let paging_index = state.paging_index as usize;
-                let row_bound = window_height() - 1;
-                let paging_index_bound = state.paging_index as usize;
-                let display_lines = &state.input;
-
-                (
-                    pos,
-                    paging_index,
-                    row_bound,
-                    paging_index_bound,
-                    display_lines,
-                )
-            }
-            InputMode::Command => {
-                let pos = state.get_chat_position();
-                let paging_index = state.chat_paging_index as usize;
-                let row_bound = window_height() - CHAT_BOX_HEIGHT - 2;
-                let paging_index_bound = state.chat_display.len()
-                    - (window_height() as usize - CHAT_BOX_HEIGHT as usize - 1);
-                let display_lines = &state.chat_display;
-
-                (
-                    pos,
-                    paging_index,
-                    row_bound,
-                    paging_index_bound,
-                    display_lines,
-                )
-            }
-        };
-
-    let mut col = pos.0 as usize;
-    let mut row = pos.1 as usize;
-
-    let mut chars = state.get_current_line().chars().collect::<Vec<char>>();
-
-    // if we're already in whitespace, find the next word
-    while chars.len() == 0 || (col < chars.len() && chars[col as usize] == ' ') {
-        col += 1;
-
-        if col >= chars.len() {
-            let bounds = state.cursor_position_to_string_position((col as u16, row as u16));
-
-            if bounds.1 + 1 < display_lines.len() as u16 {
-                col = 0;
-
-                if row as u16 == row_bound && paging_index < paging_index_bound {
-                    paging_index += 1;
-                } else {
-                    row += 1;
-                }
-
-                chars = display_lines[(bounds.1 + 1) as usize]
-                    .chars()
-                    .collect::<Vec<char>>();
-            } else {
-                break;
-            }
-        }
-    }
-
-    while col < chars.len() && chars[col as usize] != ' ' {
-        col += 1;
-
-        if col == chars.len() {
-            let bounds = state.cursor_position_to_string_position((col as u16, row as u16));
-
-            if bounds.1 + 1 < display_lines.len() as u16 {
-                col = 0;
-
-                if row as u16 == row_bound && paging_index < paging_index_bound {
-                    paging_index += 1;
-                } else {
-                    row += 1;
-                }
-
-                chars = display_lines[(bounds.1 + 1) as usize]
-                    .chars()
-                    .collect::<Vec<char>>();
-            } else {
-                break;
-            }
-        }
-    }
-
-    (col as u16, row as u16)
-}
-
-fn previous_word(state: &mut State) -> (u16, u16) {
-    let (pos, mut paging_index, row_bound, paging_index_bound, display_lines) =
-        match state.input_mode {
-            InputMode::Edit => {
-                let pos = state.get_input_position();
-                let paging_index = state.paging_index as usize;
-                let row_bound = 0;
-                let paging_index_bound = state.paging_index as usize;
-                let display_lines = &state.input;
-
-                (
-                    pos,
-                    paging_index,
-                    row_bound,
-                    paging_index_bound,
-                    display_lines,
-                )
-            }
-            InputMode::Command => {
-                let pos = state.get_chat_position();
-                let paging_index = state.chat_paging_index as usize;
-                let row_bound = 0;
-                let paging_index_bound = state.chat_display.len()
-                    - (window_height() as usize - CHAT_BOX_HEIGHT as usize - 1);
-                let display_lines = &state.chat_display;
-
-                (
-                    pos,
-                    paging_index,
-                    row_bound,
-                    paging_index_bound,
-                    display_lines,
-                )
-            }
-        };
-
-    let mut col = pos.0 as i16;
-    let mut row = pos.1 as i16;
-
-    let mut chars = state.get_current_line().chars().collect::<Vec<char>>();
-
-    // doing this feels like band-aid patch
-    // is there a better place to address the bounds?
-    col = std::cmp::min(col, chars.len() as i16 - 1);
-
-    // if we're already in whitespace, find the next word
-    while chars.len() == 0 || (col > -1 && chars[col as usize] == ' ') {
-        col -= 1;
-
-        if col <= 0 {
-            let bounds = state.cursor_position_to_string_position((col as u16, row as u16));
-
-            if bounds.1 > 0 {
-                if row == row_bound && paging_index > paging_index_bound {
-                    paging_index -= 1;
-                } else {
-                    row -= 1;
-                }
-
-                chars = display_lines[(bounds.1 - 1) as usize]
-                    .chars()
-                    .collect::<Vec<char>>();
-
-                col = chars.len() as i16 - 1;
-            } else {
-                break;
-            }
-        }
-    }
-
-    while col > -1 && chars[col as usize] != ' ' {
-        col -= 1;
-
-        if col <= 0 {
-            let bounds = state.cursor_position_to_string_position((col as u16, row as u16));
-
-            if bounds.1 > 0 {
-                if row == row_bound && paging_index > paging_index_bound {
-                    paging_index -= 1;
-                } else {
-                    row -= 1;
-                }
-
-                chars = display_lines[(bounds.1 - 1) as usize]
-                    .chars()
-                    .collect::<Vec<char>>();
-
-                col = chars.len() as i16 - 1;
-            } else {
-                break;
-            }
-        }
-    }
-
-    col = std::cmp::max(col, 0);
-
-    (col as u16, row as u16)
-}
-
-// wet code because the borrow checker is horrible
-// moving to zig after this project
-fn up(state: &mut State) {
-    match state.input_mode {
-        InputMode::Edit => {
-            let row = state.get_input_position().1;
-            if row == 0 && state.paging_index > 0 {
-                state.paging_index -= 1;
-            } else if row > 0 {
-                state.input_cursor_position.1 -= 1;
-
-                let line = state.get_current_line();
-                state.input_cursor_position.0 = clamp(
-                    state.input_cursor_position.0,
-                    (line.len() + PROMPT.len()) as u16,
-                );
-
-                move_cursor(state.input_cursor_position);
-            }
-        }
-        InputMode::Command => {
-            let row = state.get_chat_position().1;
-            if row == 0 && state.chat_paging_index > 0 {
-                state.chat_paging_index -= 1;
-            } else if row > 0 {
-                state.highlight_cursor_position.1 -= 1;
-
-                state.highlight_cursor_position.0 = clamp(
-                    state.highlight_cursor_position.0,
-                    state.get_current_line_length() as u16,
-                );
-
-                move_cursor(state.highlight_cursor_position);
-            }
-        }
-    }
-}
-
-// wet code because the borrow checker is horrible
-// moving to zig after this project
-fn down(state: &mut State) {
-    match state.input_mode {
-        InputMode::Command => {
-            let row = state.get_chat_position().1;
-            if row + state.chat_paging_index + 1 < state.chat_display.len() as u16 {
-                // one above the separator makes minus 2
-                if row == window_height() - CHAT_BOX_HEIGHT - 2
-                    && row + state.chat_paging_index + 1 < state.chat_display.len() as u16
-                {
-                    state.chat_paging_index += 1;
-                } else {
-                    state.highlight_cursor_position.1 += 1;
-
-                    state.highlight_cursor_position.0 = clamp(
-                        state.highlight_cursor_position.0,
-                        state.get_current_line_length() as u16,
+                if cursor.0 >= page_check.window_size.1 - 2 {
+                    let diff = cursor.0 - (page_check.window_size.1 - 2) + 1;
+                    page_check.page = std::cmp::min(
+                        page_check.page + diff,
+                        page_check.line_lengths.len() - (page_check.window_size.1 - 2),
                     );
-
-                    move_cursor(state.highlight_cursor_position);
+                    cursor.0 = page_check.window_size.1 - 3;
+                } else if cursor.0 == 0 && state.pending_page_up && page_check.page > 0 {
+                    page_check.page -= 1;
                 }
-            }
-        }
-        InputMode::Edit => {
-            let row = state.get_input_position().1;
-            if row + state.paging_index < state.input.len() as u16 - 1 {
-                if row == CHAT_BOX_HEIGHT - 1
-                    && row + state.paging_index + 1 < state.input.len() as u16
-                {
-                    state.paging_index += 1;
-                } else {
-                    state.input_cursor_position.1 += 1;
 
-                    let line = state.get_current_line();
-                    state.input_cursor_position.0 = clamp(
-                        state.input_cursor_position.0,
-                        (line.len() + PROMPT.len()) as u16,
-                    );
-
-                    move_cursor(state.input_cursor_position);
-                }
-            }
-        }
-    }
-}
-
-fn page_up(state: &mut State) {
-    match state.input_mode {
-        InputMode::Command => {
-            state.chat_paging_index = std::cmp::max(
-                0,
-                state.chat_paging_index as i16
-                    - (window_height() as i16 - CHAT_BOX_HEIGHT as i16 - 1 as i16),
-            ) as u16;
-
-            state.highlight_cursor_position.0 = clamp(
-                state.highlight_cursor_position.0,
-                state.get_current_line_length() as u16,
-            );
-        }
-        _ => {}
-    }
-}
-
-fn page_down(state: &mut State) {
-    let lower_bound = std::cmp::max(
-        state.chat_display.len() as i16 - window_height() as i16 + CHAT_BOX_HEIGHT as i16 + 1,
-        0,
-    ) as u16;
-
-    match state.input_mode {
-        InputMode::Command => {
-            state.chat_paging_index = std::cmp::min(
-                lower_bound,
-                state.chat_paging_index + window_height() - CHAT_BOX_HEIGHT - 1,
-            );
-
-            state.highlight_cursor_position.0 = clamp(
-                state.highlight_cursor_position.0,
-                state.get_current_line_length() as u16,
-            );
-        }
-        _ => {}
-    }
-}
-
-fn cursor_to_line() {
-    print!("\x1B[6 q");
-    std::io::stdout().flush().unwrap();
-}
-
-fn cursor_to_block() {
-    print!("\x1B[2 q");
-    std::io::stdout().flush().unwrap();
-}
-
-fn chat_submit(state: &mut State) {
-    let message = state.input.join("\n").trim().to_string();
-    state.push_message(api::Message::new(api::MessageType::User, message));
-
-    state.input = vec![String::new()];
-
-    let origin = input_origin();
-    state.input_cursor_position.0 = origin.0;
-    state.input_cursor_position.1 = origin.1;
-    state.paging_index = 0;
-
-    move_cursor(state.input_cursor_position);
-}
-
-fn enter(state: &mut State) -> bool {
-    if state.input_mode == InputMode::Edit {
-        let pos = state.get_input_position();
-        let pos = (pos.0, pos.1 + state.paging_index);
-        let remainder = state.input[pos.1 as usize][pos.0 as usize..].to_string();
-        state.input[pos.1 as usize] = state.input[pos.1 as usize][..pos.0 as usize].to_string();
-
-        state.input.push(remainder);
-        state.input_cursor_position.0 = PROMPT.len() as u16;
-
-        let row = state.get_input_position().1;
-        if row == CHAT_BOX_HEIGHT - 1 {
-            state.paging_index += 1;
-        } else {
-            state.input_cursor_position.1 += 1;
-        }
-    }
-
-    true
-}
-
-fn get_clipboard_text() -> String {
-    let mut ctx = ClipboardContext::new().unwrap();
-    ctx.get_contents().unwrap()
-}
-
-// the return signifies whether the program should continue running
-fn input(state: &mut State, c: char, key_modifiers: crossterm::event::KeyModifiers) -> bool {
-    if state.input_mode == InputMode::Command {
-        if c == 'q' {
-            return false;
-        }
-
-        if c == 'a' {
-            state.input_mode = InputMode::Edit;
-            cursor_to_line();
-            move_cursor(state.input_cursor_position);
-        }
-
-        if c == 'y' {
-            let (col, row) = state.get_chat_position();
-            let line_number = row as usize + state.chat_paging_index as usize;
-            let message = state.messages[line_number].content.clone();
-            let mut ctx = ClipboardContext::new().unwrap();
-            ctx.set_contents(message).unwrap();
-        }
-    } else {
-        if c == 'v' && key_modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
-            let clipboard_text = get_clipboard_text();
-
-            if clipboard_text.is_empty() {
-                return true;
+                state.pending_page_up = false;
             }
 
-            let (col, row) = state.get_input_position();
-
-            let mut current_line = state.get_current_line();
-            current_line.insert_str(col as usize, &clipboard_text);
-
-            let new_lines = wrap(&current_line, window_width() as usize - 1);
-            let new_col = new_lines.last().unwrap().len() as u16 + PROMPT.len() as u16;
-            let mut line_number = row as usize + state.paging_index as usize;
-            state.input.remove(line_number);
-
-            for line in new_lines.iter() {
-                state.input.insert(line_number, line.clone());
-                line_number += 1;
-            }
-
-            let total_height = window_height();
-            state.input_cursor_position.0 = new_col;
-            state.input_cursor_position.1 += new_lines.len() as u16 - 1;
-            if state.input_cursor_position.1 >= total_height {
-                state.paging_index += state.input_cursor_position.1 - total_height + 1;
-            }
-
-            state.input_cursor_position.1 =
-                std::cmp::min(state.input_cursor_position.1, total_height - 1);
-
-            move_cursor(state.input_cursor_position);
-        } else {
-            let (col, row) = state.get_input_position();
-            let line_number = row as usize + state.paging_index as usize;
-            if state.input[line_number].len() == window_width() as usize - 1 {
+            if state.pending_chat_update.len() > 0 {
                 state
-                    .input
-                    .insert(line_number + 1, String::from(format!("{}", c)));
-                state.input_cursor_position.0 = PROMPT.len() as u16 + 1;
-                state.input_cursor_position.1 += 1;
-            } else {
-                state.input[line_number].insert(col as usize, c);
-                state.input_cursor_position.0 += 1;
+                    .chat_wrapped
+                    .content
+                    .push_str(&state.pending_chat_update);
+                state.rewrap(chat_box);
+                state.pending_chat_update = String::new();
+            }
+
+            // if we have pending deletions, the cursors should already be valid
+            if state.pending_deletions > 0 {
+                info!(
+                    "calling delete with cursor: {:?} on {:?}",
+                    (
+                        state.input_cursor.0 + state.input_wrapped.page,
+                        state.input_cursor.1,
+                    ),
+                    state.input_wrapped
+                );
+                let offset = state.input_wrapped.get_flat(
+                    state.input_cursor.0 + state.input_wrapped.page,
+                    state.input_cursor.1 + (if state.input_cursor.0 > 0 { 1 } else { 0 }),
+                    true,
+                );
+
+                if offset < state.pending_deletions {
+                    state.pending_deletions = offset;
+                }
+
+                if state.pending_deletions > 0 {
+                    let lower = std::cmp::max(offset - state.pending_deletions, 0);
+                    let upper = offset;
+
+                    let deleted = state.input_wrapped.content.drain(lower..upper);
+                    // setting it to the max width
+                    // with the assumption that it'll be placed within bounds on the next clamp
+                    if deleted.as_str() == "\n" {
+                        state.input_cursor.1 = input_box.width as usize;
+                        if state.input_wrapped.page > 0 {
+                            state.input_wrapped.page -= 1;
+                        }
+                    }
+
+                    drop(deleted);
+
+                    state.pending_deletions = 0;
+                    state.rewrap(input_box);
+                }
+            }
+
+            state.clamp_cursor();
+
+            // the cursor should always be clamped before reaching here
+            let (display_cursor, focused_area) = match state.input_mode {
+                InputMode::Normal => (state.chat_cursor, chat_box),
+                InputMode::Insert => (state.input_cursor, input_box),
+            };
+
+            frame.render_widget(
+                Paragraph::new(state.chat_wrapped.display()).block(Block::bordered().title("Chat")),
+                chat_box,
+            );
+
+            frame.render_widget(
+                Paragraph::new(state.input_wrapped.display())
+                    .block(Block::bordered().title("Input")),
+                input_box,
+            );
+
+            frame.render_widget(
+                Paragraph::new(match state.input_mode {
+                    InputMode::Insert => "Insert",
+                    InputMode::Normal => "Command",
+                })
+                .style(Style::default().fg(Color::Black).bg(
+                    match state.input_mode {
+                        InputMode::Insert => Color::LightYellow,
+                        InputMode::Normal => Color::LightCyan,
+                    },
+                )),
+                status_bar,
+            );
+
+            frame.set_cursor_position(Position::new(
+                focused_area.x + display_cursor.1 as u16 + 1,
+                focused_area.y + display_cursor.0 as u16 + 1,
+            ));
+        })?;
+
+        match rx.try_recv() {
+            Ok(message) => {
+                let last_message = state.chat_messages.last_mut().unwrap();
+                last_message.content.push_str(&message.clone());
+
+                state.pending_chat_update = message;
+                state.chat_cursor.0 = state.chat_wrapped.line_lengths.len();
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(e) => panic!("{}", e),
+        };
+
+        if event::poll(std::time::Duration::from_millis(25))? {
+            match event::read() {
+                Ok(Event::Key(key)) => {
+                    if key.kind == KeyEventKind::Press {
+                        if state.input_mode == InputMode::Normal {
+                            match key.code {
+                                KeyCode::Tab => {
+                                    info!("{:?}", state.input_wrapped);
+                                }
+                                KeyCode::Char('q') => {
+                                    break;
+                                }
+                                KeyCode::Char('i') | KeyCode::Char('a') => {
+                                    state.input_mode = InputMode::Insert;
+                                }
+                                KeyCode::Enter => {
+                                    if state.input_wrapped.len() > 0 {
+                                        state.chat_messages.push(api::Message {
+                                            message_type: api::MessageType::User,
+                                            content: state.input_wrapped.content.clone(),
+                                        });
+
+                                        state.pending_chat_update =
+                                            (if state.chat_messages.len() > 1 {
+                                                "\n───\n".to_string()
+                                            } else {
+                                                "".to_string()
+                                            }) + &state.input_wrapped.content.clone()
+                                                + "\n───\n";
+
+                                        let messages = state.chat_messages.clone();
+                                        let prompt = system_prompt.to_string();
+                                        let api = api.to_string();
+                                        let tx = tx.clone();
+                                        std::thread::spawn(move || {
+                                            match api::prompt_stream(prompt, &messages, api, tx) {
+                                                Ok(_) => {}
+                                                Err(e) => {
+                                                    error!(
+                                                        "error sending message to GPT endpoint: {}",
+                                                        e
+                                                    );
+                                                    std::process::exit(1);
+                                                }
+                                            }
+                                        });
+                                    }
+
+                                    state.input_wrapped.clear();
+                                }
+                                KeyCode::Left => {
+                                    // underflow
+                                    if state.chat_cursor.1 > 0 {
+                                        state.chat_cursor.1 -= 1;
+                                    }
+                                }
+                                KeyCode::Right => {
+                                    state.chat_cursor.1 += 1;
+                                }
+                                KeyCode::Up => {
+                                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                        state.chat_wrapped.page_up();
+                                    } else {
+                                        // underflow
+                                        if state.chat_cursor.0 > 0 {
+                                            state.chat_cursor.0 -= 1;
+                                        } else {
+                                            state.pending_page_up = true;
+                                        }
+                                    }
+                                }
+                                KeyCode::Down => {
+                                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                        state.chat_wrapped.page_down();
+                                        state.chat_cursor.0 = state.chat_wrapped.window_size.1;
+                                    } else {
+                                        state.chat_cursor.0 += 1;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        } else if state.input_mode == InputMode::Insert {
+                            match key.code {
+                                KeyCode::Esc => {
+                                    state.input_mode = InputMode::Normal;
+                                }
+                                KeyCode::Char(c) => {
+                                    if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                        match c {
+                                            'w' => {
+                                                let deleted = state.input_wrapped.delete_word(
+                                                    state.input_cursor.0,
+                                                    state.input_cursor.1,
+                                                );
+
+                                                if deleted.contains('\n') {
+                                                    state.input_cursor.1 =
+                                                        state.input_wrapped.window_size.0;
+                                                }
+                                            }
+                                            'v' => {
+                                                let mut ctx = ClipboardContext::new().unwrap();
+                                                let clip_contents = ctx.get_contents().unwrap();
+
+                                                let lines = clip_contents
+                                                    .chars()
+                                                    .filter(|c| *c == '\n')
+                                                    .count();
+
+                                                state.input_wrapped.insert(
+                                                    &clip_contents,
+                                                    state.input_cursor.0 + state.input_wrapped.page,
+                                                    state.input_cursor.1,
+                                                );
+
+                                                state.input_cursor.0 += lines;
+                                                state.input_cursor.1 =
+                                                    state.input_wrapped.window_size.0;
+                                            }
+                                            _ => {}
+                                        }
+                                    } else {
+                                        state.input_wrapped.insert(
+                                            &c.to_string(),
+                                            state.input_cursor.0 + state.input_wrapped.page,
+                                            state.input_cursor.1,
+                                        );
+
+                                        state.input_cursor.1 += 1;
+                                    }
+
+                                    state.pending_changes = true;
+                                }
+                                KeyCode::Enter => {
+                                    state.input_wrapped.insert(
+                                        &'\n'.to_string(),
+                                        state.input_cursor.0 + state.input_wrapped.page,
+                                        state.input_cursor.1,
+                                    );
+
+                                    state.input_cursor.0 += 1;
+                                    state.input_cursor.1 = 0;
+                                    state.pending_changes = true;
+                                }
+                                KeyCode::Backspace => {
+                                    if state.input_wrapped.len() > 0 {
+                                        state.pending_deletions += 1;
+                                    }
+                                }
+                                KeyCode::Left => {
+                                    // underflow
+                                    if state.input_cursor.1 > 0 {
+                                        state.input_cursor.1 -= 1;
+                                    }
+                                }
+                                KeyCode::Right => {
+                                    state.input_cursor.1 += 1;
+                                }
+                                KeyCode::Up => {
+                                    // underflow
+                                    if state.input_cursor.0 > 0 {
+                                        state.input_cursor.0 -= 1;
+                                    } else {
+                                        state.pending_page_up = true;
+                                    }
+                                }
+                                KeyCode::Down => {
+                                    state.input_cursor.0 += 1;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    panic!("error reading event: {}", e);
+                }
+                _ => {}
             }
         }
     }
 
-    return true;
-}
+    ratatui::restore();
 
-fn backspace(state: &mut State) {
-    if state.input_mode == InputMode::Edit {
-        let (col, row) = state.get_input_position();
-        let line_number = (row + state.paging_index) as usize;
-        if col > 0 {
-            state.input[line_number].remove(col as usize - 1);
-            state.input_cursor_position.0 -= 1;
-            move_cursor(state.input_cursor_position);
-        } else if line_number > 0 {
-            let removed_line = state.input.remove(line_number);
-            state.input_cursor_position.0 =
-                state.input[line_number - 1].len() as u16 + PROMPT.len() as u16;
-
-            if row > 0 && state.paging_index == 0 {
-                state.input_cursor_position.1 -= 1;
-            } else if state.paging_index > 0 {
-                state.paging_index -= 1;
-            }
-
-            move_cursor(state.input_cursor_position);
-            state.input[line_number - 1].push_str(&removed_line);
-        }
-    }
+    Ok(state.chat_messages)
 }
