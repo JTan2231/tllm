@@ -305,9 +305,7 @@ pub fn prompt_stream(
     };
 
     match response {
-        Ok(full_message) => {
-            info!("Response: {}", full_message);
-        }
+        Ok(_) => {}
         Err(e) => {
             error!("Failed to process stream: {}", e);
             return Err(e);
