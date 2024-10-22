@@ -39,6 +39,26 @@ impl Message {
     }
 }
 
+// these two are copied from Dewey
+// this should really be all integrated into a single project
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct DeweyRequest {
+    pub k: usize,
+    pub query: String,
+    pub filters: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DeweyResponseItem {
+    pub filepath: String,
+    pub subset: (u64, u64),
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DeweyResponse {
+    pub results: Vec<DeweyResponseItem>,
+}
+
 #[derive(Clone, Debug)]
 struct RequestParams {
     provider: String,
@@ -428,4 +448,26 @@ pub fn prompt(
     }
 
     Ok(Message::new(MessageType::Assistant, content))
+}
+
+pub fn tcp_request(
+    port: &str,
+    payload: Vec<u8>,
+    tx: std::sync::mpsc::Sender<Vec<u8>>,
+) -> Result<(), std::io::Error> {
+    let mut stream = std::net::TcpStream::connect(format!("127.0.0.1:{}", port))?;
+
+    stream.write(&payload)?;
+    stream.flush()?;
+
+    let mut length_bytes = [0u8; 4];
+    stream.read_exact(&mut length_bytes)?;
+    let length = u32::from_be_bytes(length_bytes) as usize;
+
+    let mut buffer = vec![0u8; length];
+    stream.read_exact(&mut buffer)?;
+
+    tx.send(buffer).expect("Failed to send TCP response");
+
+    Ok(())
 }

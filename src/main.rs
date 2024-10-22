@@ -1,6 +1,6 @@
-mod api;
 mod display;
 mod logger;
+mod network;
 
 use crate::logger::Logger;
 
@@ -195,12 +195,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if flags.adhoc.len() > 0 {
-        let mut chat_history = vec![api::Message::new(
-            api::MessageType::User,
+        let mut chat_history = vec![network::Message::new(
+            network::MessageType::User,
             flags.adhoc.clone(),
         )];
 
-        let response = api::prompt(&flags.api, &system_prompt, &chat_history)?;
+        let response = network::prompt(&flags.api, &system_prompt, &chat_history)?;
         let content = response.content.replace("\\n", "\n");
 
         println!("{}\n\n", content);
@@ -234,9 +234,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             false => Vec::new(),
         };
 
-        let messages = match display::display(&system_prompt, &flags.api, &conversation) {
+        let messages = match display::display_manager(
+            display::WindowView::Chat,
+            &system_prompt,
+            &flags.api,
+            conversation,
+        ) {
             Ok(m) => m,
-            Err(_) => panic!("what happened"),
+            Err(e) => panic!("error: display messed up {}", e),
         };
 
         if messages.len() > 0 {

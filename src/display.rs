@@ -2,16 +2,16 @@ use copypasta::{ClipboardContext, ClipboardProvider};
 
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    layout::{Constraint, Layout, Position, Rect},
-    style::{Color, Style},
-    widgets::{Block, Paragraph},
+    layout::{Constraint, Direction, Layout, Position, Rect},
+    style::{Color, Modifier, Style},
+    widgets::{Block, List, ListState, Paragraph},
 };
 
 use crate::logger::Logger;
-use crate::{api, error, info};
+use crate::{error, info, network};
 
 #[derive(Eq, PartialEq)]
-enum InputMode {
+enum ChatInputMode {
     Normal,
     Insert,
 }
@@ -135,25 +135,26 @@ impl WrappedText {
     }
 }
 
-struct State {
+pub struct ChatState {
     input_wrapped: WrappedText,
     chat_wrapped: WrappedText,
-    input_mode: InputMode,
+    input_mode: ChatInputMode,
     pending_changes: bool,
-    chat_messages: Vec<api::Message>,
+    pub chat_messages: Vec<network::Message>,
     input_cursor: (usize, usize),
     chat_cursor: (usize, usize),
     pending_page_up: bool,
     pending_chat_update: String,
     pending_deletions: usize,
+    next_window: WindowView,
 }
 
 // there's probably a better abstraction for these interactive boxes
-impl State {
+impl ChatState {
     pub fn rewrap(&mut self, window: Rect) {
         let new_wrapped = match self.input_mode {
-            InputMode::Normal => &mut self.chat_wrapped,
-            InputMode::Insert => &mut self.input_wrapped,
+            ChatInputMode::Normal => &mut self.chat_wrapped,
+            ChatInputMode::Insert => &mut self.input_wrapped,
         };
 
         let mut wrapped_content = String::new();
@@ -182,8 +183,8 @@ impl State {
     // the bounds of the container in which it resides
     pub fn clamp_cursor(&mut self) {
         let (cursor, wrapped) = match self.input_mode {
-            InputMode::Normal => (&mut self.chat_cursor, &self.chat_wrapped),
-            InputMode::Insert => (&mut self.input_cursor, &self.input_wrapped),
+            ChatInputMode::Normal => (&mut self.chat_cursor, &self.chat_wrapped),
+            ChatInputMode::Insert => (&mut self.input_cursor, &self.input_wrapped),
         };
 
         if wrapped.line_lengths.len() == 0 {
@@ -196,7 +197,7 @@ impl State {
         let line_index = new_row + wrapped.page;
         let col_bound = if wrapped.line_lengths[line_index] > 0 {
             wrapped.line_lengths[line_index]
-                - (if cursor.0 > 0 && self.input_mode == InputMode::Insert {
+                - (if cursor.0 > 0 && self.input_mode == ChatInputMode::Insert {
                     1
                 } else {
                     0
@@ -210,14 +211,13 @@ impl State {
     }
 }
 
-pub fn display(
+pub fn chat(
+    terminal: &mut ratatui::DefaultTerminal,
     system_prompt: &str,
     api: &str,
-    conversation: &Vec<api::Message>,
-) -> Result<Vec<api::Message>, Box<dyn std::error::Error>> {
-    let mut terminal = ratatui::init();
-
-    let mut state = State {
+    conversation: &Vec<network::Message>,
+) -> Result<ChatState, Box<dyn std::error::Error>> {
+    let mut state = ChatState {
         input_wrapped: WrappedText {
             content: String::new(),
             line_lengths: Vec::new(),
@@ -232,12 +232,13 @@ pub fn display(
         },
         chat_messages: conversation.clone(),
         pending_changes: false,
-        input_mode: InputMode::Normal,
+        input_mode: ChatInputMode::Normal,
         input_cursor: (0, 0),
         chat_cursor: (0, 0),
         pending_page_up: false,
         pending_chat_update: String::new(),
         pending_deletions: 0,
+        next_window: WindowView::Chat,
     };
 
     for (i, chat) in state.chat_messages.iter().enumerate() {
@@ -270,8 +271,8 @@ pub fn display(
 
             {
                 let (cursor, page_check) = match state.input_mode {
-                    InputMode::Normal => (&mut state.chat_cursor, &mut state.chat_wrapped),
-                    InputMode::Insert => (&mut state.input_cursor, &mut state.input_wrapped),
+                    ChatInputMode::Normal => (&mut state.chat_cursor, &mut state.chat_wrapped),
+                    ChatInputMode::Insert => (&mut state.input_cursor, &mut state.input_wrapped),
                 };
 
                 if cursor.0 >= page_check.window_size.1 - 2 {
@@ -342,8 +343,8 @@ pub fn display(
 
             // the cursor should always be clamped before reaching here
             let (display_cursor, focused_area) = match state.input_mode {
-                InputMode::Normal => (state.chat_cursor, chat_box),
-                InputMode::Insert => (state.input_cursor, input_box),
+                ChatInputMode::Normal => (state.chat_cursor, chat_box),
+                ChatInputMode::Insert => (state.input_cursor, input_box),
             };
 
             frame.render_widget(
@@ -359,13 +360,13 @@ pub fn display(
 
             frame.render_widget(
                 Paragraph::new(match state.input_mode {
-                    InputMode::Insert => "Insert",
-                    InputMode::Normal => "Command",
+                    ChatInputMode::Insert => "Insert",
+                    ChatInputMode::Normal => "Command",
                 })
                 .style(Style::default().fg(Color::Black).bg(
                     match state.input_mode {
-                        InputMode::Insert => Color::LightYellow,
-                        InputMode::Normal => Color::LightCyan,
+                        ChatInputMode::Insert => Color::LightYellow,
+                        ChatInputMode::Normal => Color::LightCyan,
                     },
                 )),
                 status_bar,
@@ -393,21 +394,23 @@ pub fn display(
             match event::read() {
                 Ok(Event::Key(key)) => {
                     if key.kind == KeyEventKind::Press {
-                        if state.input_mode == InputMode::Normal {
+                        if state.input_mode == ChatInputMode::Normal {
                             match key.code {
                                 KeyCode::Tab => {
-                                    info!("{:?}", state.input_wrapped);
+                                    state.next_window = state.next_window.next();
+                                    break;
                                 }
                                 KeyCode::Char('q') => {
+                                    state.next_window = WindowView::Exit;
                                     break;
                                 }
                                 KeyCode::Char('i') | KeyCode::Char('a') => {
-                                    state.input_mode = InputMode::Insert;
+                                    state.input_mode = ChatInputMode::Insert;
                                 }
                                 KeyCode::Enter => {
                                     if state.input_wrapped.len() > 0 {
-                                        state.chat_messages.push(api::Message {
-                                            message_type: api::MessageType::User,
+                                        state.chat_messages.push(network::Message {
+                                            message_type: network::MessageType::User,
                                             content: state.input_wrapped.content.clone(),
                                         });
 
@@ -424,7 +427,8 @@ pub fn display(
                                         let api = api.to_string();
                                         let tx = tx.clone();
                                         std::thread::spawn(move || {
-                                            match api::prompt_stream(prompt, &messages, api, tx) {
+                                            match network::prompt_stream(prompt, &messages, api, tx)
+                                            {
                                                 Ok(_) => {}
                                                 Err(e) => {
                                                     error!(
@@ -470,10 +474,10 @@ pub fn display(
                                 }
                                 _ => {}
                             }
-                        } else if state.input_mode == InputMode::Insert {
+                        } else if state.input_mode == ChatInputMode::Insert {
                             match key.code {
                                 KeyCode::Esc => {
-                                    state.input_mode = InputMode::Normal;
+                                    state.input_mode = ChatInputMode::Normal;
                                 }
                                 KeyCode::Char(c) => {
                                     if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -571,7 +575,275 @@ pub fn display(
         }
     }
 
+    Ok(state)
+}
+
+#[derive(PartialEq)]
+enum DirectoryInputMode {
+    Search,
+    Files,
+}
+
+struct DirectoryState {
+    input_mode: DirectoryInputMode,
+    search_max_width: usize,
+    search_content: String,
+    // the search bar will only ever be one line
+    search_cursor: usize,
+    search_results: Vec<network::DeweyResponseItem>,
+    results_state: ListState,
+    next_window: WindowView,
+}
+
+pub fn directory(
+    terminal: &mut ratatui::DefaultTerminal,
+) -> Result<WindowView, Box<dyn std::error::Error>> {
+    let mut state = DirectoryState {
+        input_mode: DirectoryInputMode::Search,
+        search_max_width: 0,
+        search_content: String::new(),
+        search_cursor: 0,
+        search_results: Vec::new(),
+        results_state: ListState::default(),
+        next_window: WindowView::Directory,
+    };
+
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+
+    loop {
+        terminal.draw(|frame| {
+            let main_layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints(vec![Constraint::Max(3), Constraint::Min(3)])
+                .split(frame.area());
+
+            let results_layout = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints(vec![Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(main_layout[1]);
+
+            state.search_max_width = main_layout[0].width as usize;
+
+            let list = List::new(
+                state
+                    .search_results
+                    .iter()
+                    .map(|response| response.filepath.clone()),
+            )
+            .block(Block::bordered().title("File Results"))
+            .highlight_style(Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD))
+            .highlight_symbol(">")
+            .repeat_highlight_symbol(true);
+
+            frame.render_widget(
+                Paragraph::new(state.search_content.clone())
+                    .block(Block::bordered().title("Search")),
+                main_layout[0],
+            );
+
+            frame.render_stateful_widget(list, results_layout[0], &mut state.results_state);
+
+            frame.render_widget(
+                Paragraph::new(match state.results_state.selected() {
+                    Some(i) => {
+                        let selected = state.search_results[i].clone();
+                        let contents = match std::fs::read_to_string(selected.filepath.clone()) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                error!("error reading file {}: {}", selected.filepath.clone(), e);
+
+                                format!("error reading file {}: {}", selected.filepath, e)
+                            }
+                        };
+
+                        contents[selected.subset.0 as usize..selected.subset.1 as usize].to_string()
+                    }
+                    None => String::new(),
+                })
+                .block(Block::bordered().title("Contents")),
+                results_layout[1],
+            );
+
+            let (display_cursor, focused_area) = match state.input_mode {
+                DirectoryInputMode::Search => ((0, state.search_cursor), main_layout[0]),
+                DirectoryInputMode::Files => ((0, 0), results_layout[0]),
+            };
+
+            if state.input_mode == DirectoryInputMode::Search {
+                frame.set_cursor_position(Position::new(
+                    focused_area.x + display_cursor.1 as u16 + 1,
+                    focused_area.y + display_cursor.0 as u16 + 1,
+                ));
+            }
+        })?;
+
+        match rx.try_recv() {
+            Ok(buffer) => {
+                let buffer = String::from_utf8_lossy(&buffer);
+                let response: network::DeweyResponse = match serde_json::from_str(&buffer) {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        error!("Failed to parse response: {}", e);
+                        error!("buffer: {:?}", buffer);
+                        return Err(e.into());
+                    }
+                };
+
+                state.search_results = response.results.iter().map(|f| f.clone()).collect();
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(e) => panic!("{}", e),
+        };
+
+        if event::poll(std::time::Duration::from_millis(25))? {
+            match event::read() {
+                Ok(Event::Key(key)) => {
+                    if key.kind == KeyEventKind::Press {
+                        if state.input_mode == DirectoryInputMode::Files {
+                            match key.code {
+                                KeyCode::Tab => {
+                                    state.next_window = state.next_window.next();
+                                    break;
+                                }
+                                KeyCode::Char('q') => {
+                                    break;
+                                }
+                                KeyCode::Char('s') => {
+                                    state.input_mode = DirectoryInputMode::Search;
+                                }
+                                KeyCode::Up => {
+                                    state.results_state.select_previous();
+                                }
+                                KeyCode::Down => {
+                                    state.results_state.select_next();
+                                }
+                                _ => {}
+                            }
+                        } else if state.input_mode == DirectoryInputMode::Search {
+                            match key.code {
+                                KeyCode::Esc => {
+                                    state.input_mode = DirectoryInputMode::Files;
+                                }
+                                KeyCode::Char(c) => {
+                                    if state.search_content.len() < state.search_max_width {
+                                        state.search_content.push(c);
+
+                                        if state.search_cursor < state.search_max_width {
+                                            state.search_cursor += 1;
+                                        }
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    let request = serde_json::to_string(&network::DeweyRequest {
+                                        k: 10,
+                                        query: state.search_content.clone(),
+                                        filters: Vec::new(),
+                                    })?
+                                    .into_bytes();
+
+                                    let mut payload = Vec::new();
+                                    payload
+                                        .extend_from_slice(&(request.len() as u32).to_be_bytes());
+                                    payload.extend_from_slice(&request);
+
+                                    let tx = tx.clone();
+                                    std::thread::spawn(move || {
+                                        match network::tcp_request("5051", payload, tx) {
+                                            Ok(_) => {}
+                                            Err(e) => {
+                                                error!(
+                                                    "error sending message to GPT endpoint: {}",
+                                                    e
+                                                );
+                                                std::process::exit(1);
+                                            }
+                                        }
+                                    });
+                                }
+                                KeyCode::Backspace => {
+                                    if state.search_cursor > 0 {
+                                        state
+                                            .search_content
+                                            .drain(state.search_cursor - 1..state.search_cursor);
+
+                                        state.search_cursor -= 1;
+                                    }
+                                }
+                                KeyCode::Left => {
+                                    if state.search_cursor > 0 {
+                                        state.search_cursor -= 1;
+                                    }
+                                }
+                                KeyCode::Right => {
+                                    if state.search_cursor < state.search_max_width
+                                        && state.search_cursor < state.search_content.len()
+                                    {
+                                        state.search_cursor += 1;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    panic!("error reading event: {}", e);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(state.next_window)
+}
+
+pub enum WindowView {
+    Chat,
+    Directory,
+    Exit,
+}
+
+impl WindowView {
+    fn next(&self) -> Self {
+        match self {
+            WindowView::Chat => WindowView::Directory,
+            WindowView::Directory => WindowView::Chat,
+            WindowView::Exit => WindowView::Exit,
+        }
+    }
+}
+
+pub fn display_manager(
+    window: WindowView,
+    system_prompt: &str,
+    api: &str,
+    mut conversation: Vec<network::Message>,
+) -> Result<Vec<network::Message>, std::io::Error> {
+    let mut terminal = ratatui::init();
+
+    let mut window = window;
+    loop {
+        match window {
+            WindowView::Chat => {
+                match chat(&mut terminal, system_prompt, api, &conversation) {
+                    Ok(state) => {
+                        conversation = state.chat_messages.clone();
+                        window = state.next_window;
+                    }
+                    Err(e) => panic!("error leaving chat: {}", e),
+                };
+            }
+            WindowView::Directory => {
+                match directory(&mut terminal) {
+                    Ok(w) => window = w,
+                    Err(e) => panic!("error leaving directory: {}", e),
+                };
+            }
+            _ => break,
+        };
+    }
+
     ratatui::restore();
 
-    Ok(state.chat_messages)
+    Ok(conversation)
 }
