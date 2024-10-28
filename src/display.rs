@@ -4,7 +4,7 @@ use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
-    widgets::{Block, List, ListState, Paragraph},
+    widgets::{Block, List, ListState, Paragraph, Wrap},
 };
 
 use crate::logger::Logger;
@@ -62,10 +62,12 @@ impl WrappedText {
     pub fn insert(&mut self, substring: &str, line: usize, column: usize) {
         let offset = self.get_flat(line, column + 1, false);
 
+        let sanitized = substring.replace("\t", "    ");
+
         if offset >= self.content.len() {
-            self.content.push_str(substring);
+            self.content.push_str(&sanitized);
         } else {
-            self.content.insert_str(offset, substring);
+            self.content.insert_str(offset, &sanitized);
         }
     }
 
@@ -164,6 +166,7 @@ impl ChatState {
             if c == '\n' || column as u16 >= window.width - 2 {
                 wrapped_content.push('\n');
                 lengths.push(column as usize);
+
                 column = 0;
             }
 
@@ -174,7 +177,10 @@ impl ChatState {
             column += c.len_utf8();
         }
 
-        lengths.push(column);
+        if column > 0 {
+            lengths.push(column);
+        }
+
         new_wrapped.line_lengths = lengths;
         new_wrapped.content = wrapped_content;
     }
@@ -300,14 +306,6 @@ pub fn chat(
 
             // if we have pending deletions, the cursors should already be valid
             if state.pending_deletions > 0 {
-                info!(
-                    "calling delete with cursor: {:?} on {:?}",
-                    (
-                        state.input_cursor.0 + state.input_wrapped.page,
-                        state.input_cursor.1,
-                    ),
-                    state.input_wrapped
-                );
                 let offset = state.input_wrapped.get_flat(
                     state.input_cursor.0 + state.input_wrapped.page,
                     state.input_cursor.1 + (if state.input_cursor.0 > 0 { 1 } else { 0 }),
@@ -322,21 +320,19 @@ pub fn chat(
                     let lower = std::cmp::max(offset - state.pending_deletions, 0);
                     let upper = offset;
 
-                    let deleted = state.input_wrapped.content.drain(lower..upper);
-                    // setting it to the max width
-                    // with the assumption that it'll be placed within bounds on the next clamp
-                    if deleted.as_str() == "\n" {
-                        state.input_cursor.1 = input_box.width as usize;
-                        if state.input_wrapped.page > 0 {
-                            state.input_wrapped.page -= 1;
-                        }
+                    state.input_wrapped.content.drain(lower..upper);
+
+                    if state.input_cursor.0 > 0 && state.input_cursor.1 == 0 {
+                        state.input_cursor.0 -= 1;
+                        state.input_cursor.1 = usize::MAX;
+                    } else {
+                        state.input_cursor.1 -= 1;
                     }
 
-                    drop(deleted);
-
                     state.pending_deletions = 0;
-                    state.rewrap(input_box);
                 }
+
+                state.rewrap(input_box);
             }
 
             state.clamp_cursor();
@@ -660,6 +656,7 @@ pub fn directory(
                     }
                     None => String::new(),
                 })
+                .wrap(Wrap { trim: false })
                 .block(Block::bordered().title("Contents")),
                 results_layout[1],
             );

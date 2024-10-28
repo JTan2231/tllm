@@ -103,6 +103,7 @@ fn parse_flags() -> Result<Flags, Box<dyn std::error::Error>> {
     match flags.api.as_str() {
         "anthropic" => {}
         "openai" => {}
+        "gemini" => {}
         _ => {
             error!("Invalid API: {}", flags.api);
             return Err("Invalid API".into());
@@ -190,6 +191,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "openai" => match std::env::var("OPENAI_API_KEY") {
             Ok(_) => (),
             Err(_) => panic!("OPENAI_API_KEY environment variable not set"),
+        },
+        "gemini" => match std::env::var("GEMINI_API_KEY") {
+            Ok(_) => (),
+            Err(_) => panic!("GEMINI_API_KEY environment variable not set"),
         },
         _ => {}
     }

@@ -98,22 +98,43 @@ fn build_request(params: &RequestParams) -> String {
             "max_tokens": params.max_tokens.unwrap(),
             "system": params.system_prompt.clone().unwrap(),
         }),
+        "gemini" => serde_json::json!({
+            "contents": params.messages.iter().map(|m| {
+                serde_json::json!({
+                    "parts": [{
+                        "text": m.content
+                    }],
+                    "role": match m.message_type {
+                        MessageType::User => "user",
+                        MessageType::Assistant => "model",
+                        _ => panic!("what is happening")
+                    }
+                })
+            }).collect::<Vec<_>>(),
+        }),
         _ => panic!("Invalid provider for request_body: {}", params.provider),
     };
 
     let json = serde_json::json!(body);
     let json_string = serde_json::to_string(&json).expect("Failed to serialize JSON");
 
-    let auth_string = match params.provider.as_str() {
-        "openai" => "Authorization: Bearer ".to_string() + &params.authorization_token,
-        "anthropic" => "x-api-key: ".to_string() + &params.authorization_token,
-        _ => panic!("Invalid provider for auth_string: {}", params.provider),
-    };
-
-    let api_version = match params.provider.as_str() {
-        "openai" => "\r\n",
-        "anthropic" => "anthropic-version: 2023-06-01\r\n\r\n",
-        _ => panic!("Invalid provider for api_version: {}", params.provider),
+    let (auth_string, api_version, path) = match params.provider.as_str() {
+        "openai" => (
+            format!("Authorization: Bearer {}\r\n", params.authorization_token),
+            "\r\n".to_string(),
+            params.path.clone(),
+        ),
+        "anthropic" => (
+            format!("x-api-key: {}\r\n", params.authorization_token),
+            "anthropic-version: 2023-06-01\r\n".to_string(),
+            params.path.clone(),
+        ),
+        "gemini" => (
+            "\r\n".to_string(),
+            "\r\n".to_string(),
+            format!("{}?key={}", params.path, params.authorization_token),
+        ),
+        _ => panic!("Invalid provider: {}", params.provider),
     };
 
     format!(
@@ -122,14 +143,18 @@ fn build_request(params: &RequestParams) -> String {
         Content-Type: application/json\r\n\
         Content-Length: {}\r\n\
         Accept: */*\r\n\
-        {}\r\n\
+        {}\
         {}\
         {}",
-        params.path,
+        path,
         params.host,
         json_string.len(),
         auth_string,
-        api_version,
+        if api_version == "\r\n" && auth_string == "\r\n" {
+            String::new()
+        } else {
+            api_version
+        },
         json_string.trim()
     )
 }
@@ -173,6 +198,26 @@ fn get_anthropic_request_params(
         stream,
         authorization_token: env::var("ANTHROPIC_API_KEY")
             .expect("ANTHROPIC_API_KEY environment variable not set"),
+        max_tokens: Some(4096),
+        system_prompt: Some(system_prompt),
+    }
+}
+
+fn get_gemini_request_params(
+    system_prompt: String,
+    chat_history: &Vec<Message>,
+    stream: bool,
+) -> RequestParams {
+    RequestParams {
+        provider: "gemini".to_string(),
+        host: "generativelanguage.googleapis.com".to_string(),
+        path: "/v1beta/models/gemini-1.5-flash-latest:generateContent".to_string(),
+        port: 443,
+        messages: chat_history.iter().cloned().collect::<Vec<Message>>(),
+        model: String::new(),
+        stream,
+        authorization_token: env::var("GEMINI_API_KEY")
+            .expect("GEMINI_API_KEY environment variable not set"),
         max_tokens: Some(4096),
         system_prompt: Some(system_prompt),
     }
@@ -301,7 +346,7 @@ pub fn prompt_stream(
     let params = match api.as_str() {
         "anthropic" => get_anthropic_request_params(system_prompt.clone(), chat_history, true),
         "openai" => get_openai_request_params(system_prompt.clone(), chat_history, true),
-        _ => panic!("Invalid API: {}--how'd this get here?", api),
+        _ => panic!("Invalid API does not yet support streaming: {}", api),
     };
 
     let stream = TcpStream::connect((params.host.clone(), params.port)).expect("Failed to connect");
@@ -343,6 +388,7 @@ pub fn prompt(
     let params = match api.as_str() {
         "anthropic" => get_anthropic_request_params(system_prompt.clone(), chat_history, false),
         "openai" => get_openai_request_params(system_prompt.clone(), chat_history, false),
+        "gemini" => get_gemini_request_params(system_prompt.clone(), chat_history, false),
         _ => panic!("Invalid API: {}--how'd this get here?", api),
     };
 
@@ -370,7 +416,6 @@ pub fn prompt(
     let mut headers = Vec::new();
     let mut line = String::new();
     while reader.read_line(&mut line).unwrap() > 0 {
-        info!("Header: {}", line);
         if line == "\r\n" {
             info!("End of headers");
             break;
@@ -381,44 +426,46 @@ pub fn prompt(
             content_length = parts[1].trim().parse().unwrap();
         }
 
+        line = line.trim().to_string();
         headers.push(line.clone());
         line.clear();
     }
 
     info!("Headers: {:?}", headers);
 
-    let mut response_body = String::new();
-    reader
-        .take(content_length as u64)
-        .read_to_string(&mut response_body)?;
-
-    info!("Response body: {}", response_body);
-
-    let mut remaining = response_body.as_str();
     let mut decoded_body = String::new();
 
     // they like to use this transfer encoding for long responses
     if headers.contains(&"Transfer-Encoding: chunked".to_string()) {
-        while !remaining.is_empty() {
-            if let Some(index) = remaining.find("\r\n") {
-                let (size_str, rest) = remaining.split_at(index);
-                let size = usize::from_str_radix(size_str.trim(), 16).unwrap_or(0);
+        let mut buffer = Vec::new();
+        loop {
+            let mut chunk_size = String::new();
+            reader.read_line(&mut chunk_size)?;
+            let chunk_size = usize::from_str_radix(chunk_size.trim(), 16)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-                if size == 0 {
-                    break;
-                }
-
-                let chunk = &rest[2..2 + size];
-                decoded_body.push_str(chunk);
-
-                remaining = &rest[2 + size + 2..];
-            } else {
+            if chunk_size == 0 {
                 break;
             }
+
+            let mut chunk = vec![0; chunk_size];
+            reader.read_exact(&mut chunk)?;
+            buffer.extend_from_slice(&chunk);
+
+            // Read and discard the CRLF at the end of the chunk
+            reader.read_line(&mut String::new())?;
         }
+
+        decoded_body = String::from_utf8(buffer).unwrap();
     } else {
-        decoded_body = response_body.to_string();
+        if content_length > 0 {
+            reader
+                .take(content_length as u64)
+                .read_to_string(&mut decoded_body)?;
+        }
     }
+
+    info!("decoded_body: {}", decoded_body);
 
     let response_json = serde_json::from_str(&decoded_body);
 
@@ -435,7 +482,14 @@ pub fn prompt(
     let mut content = match api.as_str() {
         "openai" => response_json["choices"][0]["message"]["content"].to_string(),
         "anthropic" => response_json["content"][0]["text"].to_string(),
-        _ => String::new(),
+        "gemini" => response_json["candidates"][0]["content"]["parts"][0]["text"].to_string(),
+        _ => {
+            error!(
+                "provider {} isn't yet configured for reading the HTTP response properly",
+                params.provider
+            );
+            String::new()
+        }
     };
 
     content = content
