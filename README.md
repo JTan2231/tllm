@@ -1,6 +1,6 @@
-# TLLM: Terminal-Based Large Language Model
+# TLLM
 
-A terminal-based interface for interacting with large language models.
+A terminal interface for interacting with large language models.
 
 ## Examples
 
