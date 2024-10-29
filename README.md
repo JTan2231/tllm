@@ -1,40 +1,66 @@
-# TLLM
+# TLLM: Terminal-Based Large Language Model
 
-A terminal client for chatting with LLM APIs. Very sparse on features, currently tinkering on this to fit my needs. Will probably standardize at some point and make this more presentable/user-friendly.
+A terminal-based interface for interacting with large language models.
 
-Eventually hope for this to be a complete general terminal replacement for the web interfaces, as opposed to my own idiosyncratic tool.
+## Examples
 
-## Install
+### Basic Usage
 
-TLLM currently only supports OpenAI--make sure your `OPENAI_API_KEY` environment variable is set.
-
-To install,
-```bash
-git clone https://github.com/jtan2231/tllm.git && cd tllm
-cargo build --release
-sudo cp target/release/tllm /usr/bin
 ```
-Then just use `tllm` to open a chat.
+tllm -a anthropic "What is the meaning of life?"
+```
+
+This will prompt the Anthropic API with the question "What is the meaning of life?" and display the response in your terminal.
+
+### Loading a Conversation
+
+```
+tllm -l ./conversation.json
+```
+
+This will load the conversation from the file `./conversation.json` and open it in the terminal interface.
+
+### Using a System Prompt
+
+```
+tllm -s "You are a helpful and informative AI assistant." "What is the capital of France?"
+```
+
+This will use the specified system prompt and then ask the question "What is the capital of France?".
+
+## Installation
+
+Ensure you have Rust installed. You can download and install Rust from the official website: [https://www.rust-lang.org/](https://www.rust-lang.org/).
+
+   ```bash
+   git clone https://github.com/jtan2231/tllm.git
+   cd tllm
+   cargo build
+   cargo install --path .
+   ```
 
 ## Usage
 
-The controls are vim-esque:
-- Command Mode:
-  - Cursor is a block and in the conversation display
-  - `q` to exit
-  - `a` to enter Edit Mode
-  - `Enter` to send message
-- Edit Mode:
-  - Cursor is a line in input display
-  - `ctrl + v` to paste
-  - `esc` to enter Command Mode
+1. Set your API key for the desired language model as an environment variable:
+   * Anthropic: `ANTHROPIC_API_KEY`
+   * OpenAI: `OPENAI_API_KEY`
+   * Gemini: `GEMINI_API_KEY`
 
- You can also use `ctrl + <left|right>` and `shift + <up|down>` to more quickly move about the text.
+2. Run the executable:
 
- ## TODO
+   ```bash
+   # the -a flag defaults to anthropic
+   tllm -a [gemini|anthropic|openai]
+   ```
 
- - Named conversation search
- - Embeddings (?)
- - Native text highlighting + yanking
- - CLI
- - Refactor `display.rs`--hideous code in there
+3. The terminal will display the interface, allowing you to interact with the language model.
+
+## Features
+
+* **Multiple API support:** Interact with Anthropic, OpenAI, and Gemini language models.
+* **Conversation history:** Load and save conversations for future reference.
+* **System prompt:** Set a system prompt to guide the language model's responses.
+* **Streaming support:** Receive responses in real-time for a more interactive experience.
+* **Directory view:** Search and browse files using [Dewey](https://github.com/JTan2231/dewey).
+* **Key bindings:** Use tab to switch between chat and directory view.
+* **Text editing:** Use arrow keys, backspace, and Ctrl+W/Ctrl+V for basic editing.
