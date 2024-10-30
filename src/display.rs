@@ -1,9 +1,11 @@
 use copypasta::{ClipboardContext, ClipboardProvider};
+use std::io::Read;
 
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     layout::{Constraint, Direction, Layout, Position, Rect},
-    style::{Color, Modifier, Style},
+    style::{Color, Modifier, Style, Stylize},
+    text::{Line, Span},
     widgets::{Block, List, ListState, Paragraph, Wrap},
 };
 
@@ -221,8 +223,16 @@ pub fn chat(
     terminal: &mut ratatui::DefaultTerminal,
     system_prompt: &str,
     api: &str,
-    conversation: &Vec<network::Message>,
-) -> Result<ChatState, Box<dyn std::error::Error>> {
+    conversation_path: &str,
+) -> Result<WindowView, Box<dyn std::error::Error>> {
+    let conversation = match std::path::Path::new(conversation_path).exists() {
+        true => {
+            let contents = std::fs::read_to_string(conversation_path)?;
+            serde_json::from_str(&contents)?
+        }
+        false => Vec::new(),
+    };
+
     let mut state = ChatState {
         input_wrapped: WrappedText {
             content: String::new(),
@@ -247,11 +257,7 @@ pub fn chat(
         next_window: WindowView::Chat,
     };
 
-    for (i, chat) in state.chat_messages.iter().enumerate() {
-        if i > 0 {
-            state.pending_chat_update.push_str("\n───\n");
-        }
-
+    for chat in state.chat_messages.iter() {
         state.pending_chat_update.push_str(&chat.content);
         state.pending_chat_update.push_str("\n───\n");
     }
@@ -403,6 +409,10 @@ pub fn chat(
                                 KeyCode::Char('i') | KeyCode::Char('a') => {
                                     state.input_mode = ChatInputMode::Insert;
                                 }
+                                KeyCode::Char('l') => {
+                                    state.next_window = WindowView::Load;
+                                    break;
+                                }
                                 KeyCode::Enter => {
                                     if state.input_wrapped.len() > 0 {
                                         state.chat_messages.push(network::Message {
@@ -417,6 +427,11 @@ pub fn chat(
                                                 "".to_string()
                                             }) + &state.input_wrapped.content.clone()
                                                 + "\n───\n";
+
+                                        state.chat_messages.push(network::Message {
+                                            message_type: network::MessageType::Assistant,
+                                            content: String::new(),
+                                        });
 
                                         let messages = state.chat_messages.clone();
                                         let prompt = system_prompt.to_string();
@@ -571,7 +586,17 @@ pub fn chat(
         }
     }
 
-    Ok(state)
+    let messages_json = serde_json::to_string(&state.chat_messages).unwrap();
+    match std::fs::write(conversation_path, messages_json) {
+        Ok(_) => {
+            info!("Conversation saved to {}", conversation_path);
+        }
+        Err(e) => {
+            info!("Error saving messages: {}", e);
+        }
+    }
+
+    Ok(state.next_window)
 }
 
 #[derive(PartialEq)]
@@ -703,6 +728,7 @@ pub fn directory(
                                     break;
                                 }
                                 KeyCode::Char('q') => {
+                                    state.next_window = WindowView::Exit;
                                     break;
                                 }
                                 KeyCode::Char('s') => {
@@ -794,9 +820,267 @@ pub fn directory(
     Ok(state.next_window)
 }
 
+pub fn conversation_search(
+    terminal: &mut ratatui::DefaultTerminal,
+) -> Result<(WindowView, String), Box<dyn std::error::Error>> {
+    let conversation_path = crate::config::get_conversations_dir();
+
+    let mut conversations = Vec::new();
+    for file in std::fs::read_dir(crate::config::get_conversations_dir())? {
+        let file = file?;
+        if file.path().is_file() {
+            conversations.push(network::DeweyResponseItem {
+                filepath: file.file_name().to_string_lossy().into_owned(),
+                subset: (0, 0),
+            });
+        }
+    }
+
+    conversations.sort_unstable_by(|a, b| b.filepath.cmp(&a.filepath));
+
+    let mut state = DirectoryState {
+        input_mode: DirectoryInputMode::Search,
+        search_max_width: 0,
+        search_content: String::new(),
+        search_cursor: 0,
+        search_results: conversations,
+        results_state: ListState::default(),
+        next_window: WindowView::Directory,
+    };
+
+    let mut chosen_conversation = String::new();
+
+    loop {
+        terminal.draw(|frame| {
+            let main_layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints(vec![Constraint::Max(3), Constraint::Min(3)])
+                .split(frame.area());
+
+            let results_layout = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints(vec![Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(main_layout[1]);
+
+            state.search_max_width = main_layout[0].width as usize;
+
+            let list = List::new(
+                state
+                    .search_results
+                    .iter()
+                    .map(|response| response.filepath.clone()),
+            )
+            .block(Block::bordered().title("File Results"))
+            .highlight_style(Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD))
+            .highlight_symbol(">")
+            .repeat_highlight_symbol(true);
+
+            frame.render_widget(
+                Paragraph::new(state.search_content.clone())
+                    .block(Block::bordered().title("Search")),
+                main_layout[0],
+            );
+
+            frame.render_stateful_widget(list, results_layout[0], &mut state.results_state);
+
+            let mut lines = Vec::new();
+
+            match state.results_state.selected() {
+                Some(i) => {
+                    let selected = conversation_path.join(state.search_results[i].filepath.clone());
+                    let file = std::fs::File::open(selected.clone());
+                    if file.is_err() {
+                        lines.push(Line::from(Span::styled(
+                            format!(
+                                "error reading file {}: {}",
+                                selected.to_str().unwrap(),
+                                file.err().unwrap()
+                            ),
+                            Style::new().red().bold(),
+                        )));
+                    } else {
+                        let mut file = file.unwrap();
+
+                        // limiting file reads to arbitrarily be 2kB
+                        let mut buffer = vec![0; 1024 * 2];
+                        let bytes_read = file.read(&mut buffer).unwrap();
+                        buffer.truncate(bytes_read);
+
+                        let mut contents = match String::from_utf8(buffer.clone()) {
+                            Ok(valid_string) => valid_string,
+                            Err(e) => {
+                                let e = e.utf8_error();
+                                let mut valid_length = e.valid_up_to();
+
+                                if valid_length > bytes_read {
+                                    valid_length = bytes_read;
+                                }
+
+                                let valid_bytes = &buffer[..valid_length];
+                                String::from_utf8(valid_bytes.to_vec()).unwrap()
+                            }
+                        };
+
+                        if !contents.ends_with("\"}]") {
+                            contents.push_str("\"}]");
+                        }
+
+                        contents = contents.replace("\t", "    ");
+
+                        let messages: Vec<network::Message> = match serde_json::from_str(&contents)
+                        {
+                            Ok(v) => v,
+                            Err(e) => {
+                                lines.push(Line::from(Span::styled(
+                                    format!(
+                                        "error parsing conversation json {}: {}",
+                                        selected.to_str().unwrap(),
+                                        e
+                                    ),
+                                    Style::new().red(),
+                                )));
+
+                                Vec::new()
+                            }
+                        };
+
+                        for message in messages.iter() {
+                            let mut line = Vec::new();
+                            line.push(match message.message_type {
+                                network::MessageType::User => {
+                                    Span::styled("User: ", Style::new().blue().bold())
+                                }
+                                network::MessageType::Assistant => {
+                                    Span::styled("Assistant: ", Style::new().green().bold())
+                                }
+                                _ => Span::raw(""),
+                            });
+
+                            line.push(Span::raw(message.content.clone()));
+
+                            lines.push(Line::from(line));
+                            lines.push(Line::raw("───"));
+                        }
+                    }
+                }
+                None => {}
+            };
+
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .wrap(Wrap { trim: false })
+                    .block(Block::bordered().title("Contents")),
+                results_layout[1],
+            );
+
+            let (display_cursor, focused_area) = match state.input_mode {
+                DirectoryInputMode::Search => ((0, state.search_cursor), main_layout[0]),
+                DirectoryInputMode::Files => ((0, 0), results_layout[0]),
+            };
+
+            if state.input_mode == DirectoryInputMode::Search {
+                frame.set_cursor_position(Position::new(
+                    focused_area.x + display_cursor.1 as u16 + 1,
+                    focused_area.y + display_cursor.0 as u16 + 1,
+                ));
+            }
+        })?;
+
+        if event::poll(std::time::Duration::from_millis(25))? {
+            match event::read() {
+                Ok(Event::Key(key)) => {
+                    if key.kind == KeyEventKind::Press {
+                        if state.input_mode == DirectoryInputMode::Files {
+                            match key.code {
+                                KeyCode::Tab => {
+                                    state.next_window = state.next_window.next();
+                                    break;
+                                }
+                                KeyCode::Char('q') => {
+                                    state.next_window = WindowView::Exit;
+                                    break;
+                                }
+                                KeyCode::Char('s') => {
+                                    state.input_mode = DirectoryInputMode::Search;
+                                }
+                                KeyCode::Enter => {
+                                    match state.results_state.selected() {
+                                        Some(i) => {
+                                            let selected = conversation_path
+                                                .join(state.search_results[i].filepath.clone());
+
+                                            chosen_conversation =
+                                                selected.to_string_lossy().to_string();
+                                            state.next_window = WindowView::Chat;
+
+                                            break;
+                                        }
+                                        None => {}
+                                    };
+                                }
+                                KeyCode::Up => {
+                                    state.results_state.select_previous();
+                                }
+                                KeyCode::Down => {
+                                    state.results_state.select_next();
+                                }
+                                _ => {}
+                            }
+                        } else if state.input_mode == DirectoryInputMode::Search {
+                            match key.code {
+                                KeyCode::Esc => {
+                                    state.input_mode = DirectoryInputMode::Files;
+                                }
+                                KeyCode::Char(c) => {
+                                    if state.search_content.len() < state.search_max_width {
+                                        state.search_content.push(c);
+
+                                        if state.search_cursor < state.search_max_width {
+                                            state.search_cursor += 1;
+                                        }
+                                    }
+                                }
+                                KeyCode::Backspace => {
+                                    if state.search_cursor > 0 {
+                                        state
+                                            .search_content
+                                            .drain(state.search_cursor - 1..state.search_cursor);
+
+                                        state.search_cursor -= 1;
+                                    }
+                                }
+                                KeyCode::Left => {
+                                    if state.search_cursor > 0 {
+                                        state.search_cursor -= 1;
+                                    }
+                                }
+                                KeyCode::Right => {
+                                    if state.search_cursor < state.search_max_width
+                                        && state.search_cursor < state.search_content.len()
+                                    {
+                                        state.search_cursor += 1;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    panic!("error reading event: {}", e);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok((state.next_window, chosen_conversation))
+}
+
 pub enum WindowView {
     Chat,
     Directory,
+    Load,
     Exit,
 }
 
@@ -805,6 +1089,7 @@ impl WindowView {
         match self {
             WindowView::Chat => WindowView::Directory,
             WindowView::Directory => WindowView::Chat,
+            WindowView::Load => WindowView::Exit,
             WindowView::Exit => WindowView::Exit,
         }
     }
@@ -814,18 +1099,17 @@ pub fn display_manager(
     window: WindowView,
     system_prompt: &str,
     api: &str,
-    mut conversation: Vec<network::Message>,
-) -> Result<Vec<network::Message>, std::io::Error> {
+    mut conversation_path: String,
+) -> Result<(), std::io::Error> {
     let mut terminal = ratatui::init();
 
     let mut window = window;
     loop {
         match window {
             WindowView::Chat => {
-                match chat(&mut terminal, system_prompt, api, &conversation) {
-                    Ok(state) => {
-                        conversation = state.chat_messages.clone();
-                        window = state.next_window;
+                match chat(&mut terminal, system_prompt, api, &conversation_path) {
+                    Ok(w) => {
+                        window = w;
                     }
                     Err(e) => panic!("error leaving chat: {}", e),
                 };
@@ -836,11 +1120,22 @@ pub fn display_manager(
                     Err(e) => panic!("error leaving directory: {}", e),
                 };
             }
+            WindowView::Load => {
+                match conversation_search(&mut terminal) {
+                    Ok(wc) => {
+                        window = wc.0;
+                        if wc.1.len() > 0 {
+                            conversation_path = wc.1;
+                        }
+                    }
+                    Err(e) => panic!("error leaving conversation search: {}", e),
+                };
+            }
             _ => break,
         };
     }
 
     ratatui::restore();
 
-    Ok(conversation)
+    Ok(())
 }

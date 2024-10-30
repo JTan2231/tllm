@@ -111,6 +111,11 @@ fn build_request(params: &RequestParams) -> String {
                     }
                 })
             }).collect::<Vec<_>>(),
+            "systemInstruction": {
+                "parts": [{
+                    "text": params.system_prompt,
+                }]
+            }
         }),
         _ => panic!("Invalid provider for request_body: {}", params.provider),
     };
@@ -126,7 +131,7 @@ fn build_request(params: &RequestParams) -> String {
         ),
         "anthropic" => (
             format!("x-api-key: {}\r\n", params.authorization_token),
-            "anthropic-version: 2023-06-01\r\n".to_string(),
+            "anthropic-version: 2023-06-01\r\n\r\n".to_string(),
             params.path.clone(),
         ),
         "gemini" => (
@@ -194,7 +199,7 @@ fn get_anthropic_request_params(
         path: "/v1/messages".to_string(),
         port: 443,
         messages: chat_history.iter().cloned().collect::<Vec<Message>>(),
-        model: "claude-3-5-sonnet-20240620".to_string(),
+        model: "claude-3-5-sonnet-latest".to_string(),
         stream,
         authorization_token: env::var("ANTHROPIC_API_KEY")
             .expect("ANTHROPIC_API_KEY environment variable not set"),
@@ -221,6 +226,15 @@ fn get_gemini_request_params(
         max_tokens: Some(4096),
         system_prompt: Some(system_prompt),
     }
+}
+
+fn send_delta(tx: &std::sync::mpsc::Sender<String>, delta: String) {
+    match tx.send(delta.clone()) {
+        Ok(_) => {}
+        Err(e) => {
+            error!("error sending transmission error string: {}", e);
+        }
+    };
 }
 
 fn process_openai_stream(
@@ -269,7 +283,7 @@ fn process_openai_stream(
             let delta = delta[1..delta.len() - 1].to_string();
 
             if delta != "null" {
-                tx.send(delta.clone()).expect("Failed to send OAI delta");
+                send_delta(tx, delta.clone());
                 full_message.push_str(&delta);
             }
         }
@@ -296,6 +310,8 @@ fn process_anthropic_stream(
         all_headers.push(headers.clone());
         headers.clear();
     }
+
+    info!("headers: {:?}", all_headers);
 
     let mut full_message = all_headers.join("");
     let mut event_buffer = String::new();
@@ -325,8 +341,7 @@ fn process_anthropic_stream(
             }
 
             if delta != "null" {
-                tx.send(delta.clone())
-                    .expect("Failed to send Anthropic delta");
+                send_delta(tx, delta.clone());
                 full_message.push_str(&delta);
             }
         }
@@ -357,7 +372,6 @@ pub fn prompt_stream(
         .expect("Failed to establish TLS connection");
 
     let request = build_request(&params);
-    info!("sending request {}", request);
     stream
         .write_all(request.as_bytes())
         .expect("Failed to write to stream");
@@ -391,11 +405,6 @@ pub fn prompt(
         "gemini" => get_gemini_request_params(system_prompt.clone(), chat_history, false),
         _ => panic!("Invalid API: {}--how'd this get here?", api),
     };
-
-    info!("Using params: {:?}", params);
-
-    info!("Connecting to {}:{}", params.host, params.port);
-
     let stream = TcpStream::connect((params.host.clone(), params.port))?;
 
     let connector = native_tls::TlsConnector::new().expect("Failed to create TLS connector");
@@ -403,13 +412,9 @@ pub fn prompt(
         .connect(&params.host, stream)
         .expect("Failed to establish TLS connection");
 
-    info!("TLS connection established");
-
     let request = build_request(&params);
     stream.write_all(request.as_bytes())?;
     stream.flush()?;
-
-    info!("Request sent: {}", request);
 
     let mut reader = std::io::BufReader::new(stream);
     let mut content_length = 0;
@@ -430,8 +435,6 @@ pub fn prompt(
         headers.push(line.clone());
         line.clear();
     }
-
-    info!("Headers: {:?}", headers);
 
     let mut decoded_body = String::new();
 
@@ -464,8 +467,6 @@ pub fn prompt(
                 .read_to_string(&mut decoded_body)?;
         }
     }
-
-    info!("decoded_body: {}", decoded_body);
 
     let response_json = serde_json::from_str(&decoded_body);
 

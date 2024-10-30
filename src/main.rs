@@ -1,3 +1,4 @@
+mod config;
 mod display;
 mod logger;
 mod network;
@@ -23,15 +24,6 @@ impl Flags {
             system_prompt: String::new(),
             load_conversation: String::new(),
         }
-    }
-}
-
-fn create_if_nonexistent(path: &std::path::PathBuf) {
-    if !path.exists() {
-        match std::fs::create_dir_all(&path) {
-            Ok(_) => (),
-            Err(e) => panic!("Failed to create directory: {:?}, {}", path, e),
-        };
     }
 }
 
@@ -115,35 +107,10 @@ fn parse_flags() -> Result<Flags, Box<dyn std::error::Error>> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let now: String = chrono::Local::now().timestamp_micros().to_string();
+    config::setup();
 
-    match std::env::var("OPENAI_API_KEY") {
-        Ok(_) => (),
-        Err(_) => panic!("OPENAI_API_KEY environment variable not set"),
-    }
-
-    let home_dir = match std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .or_else(|_| {
-            std::env::var("HOMEDRIVE").and_then(|homedrive| {
-                std::env::var("HOMEPATH").map(|homepath| format!("{}{}", homedrive, homepath))
-            })
-        }) {
-        Ok(dir) => std::path::PathBuf::from(dir),
-        Err(_) => panic!("Failed to get home directory"),
-    };
-
-    let local_path = home_dir.join(".local/tllm");
-    let config_path = home_dir.join(".config/tllm");
-
-    let conversations_path = local_path.join("conversations");
-    let logging_path = local_path.join("logs");
-    logger::Logger::init(format!("{}/debug.log", logging_path.to_str().unwrap()));
-
-    create_if_nonexistent(&local_path);
-    create_if_nonexistent(&config_path);
-
-    create_if_nonexistent(&conversations_path);
-    create_if_nonexistent(&logging_path);
+    let config_path = config::get_config_dir();
+    let conversations_path = config::get_conversations_dir();
 
     let flags = parse_flags()?;
 
@@ -200,10 +167,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if flags.adhoc.len() > 0 {
-        let mut chat_history = vec![network::Message::new(
-            network::MessageType::User,
-            flags.adhoc.clone(),
-        )];
+        let adhoc = if std::path::PathBuf::from(&flags.adhoc).exists() {
+            std::fs::read_to_string(flags.adhoc.clone())?
+        } else {
+            flags.adhoc.clone()
+        };
+
+        let mut chat_history = vec![network::Message::new(network::MessageType::User, adhoc)];
 
         let response = network::prompt(&flags.api, &system_prompt, &chat_history)?;
         let content = response.content.replace("\\n", "\n");
@@ -231,51 +201,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     } else {
-        let conversation = match std::path::Path::new(&flags.load_conversation.clone()).exists() {
-            true => {
-                let contents = std::fs::read_to_string(flags.load_conversation.clone())?;
-                serde_json::from_str(&contents)?
-            }
-            false => Vec::new(),
-        };
-
-        let messages = match display::display_manager(
+        match display::display_manager(
             display::WindowView::Chat,
             &system_prompt,
             &flags.api,
-            conversation,
+            flags.load_conversation.clone(),
         ) {
-            Ok(m) => m,
-            Err(e) => panic!("error: display messed up {}", e),
+            Ok(_) => {}
+            Err(e) => panic!("error in display manager: {}", e),
         };
-
-        if messages.len() > 0 {
-            let name = now.clone();
-            let messages_json = serde_json::to_string(&messages).unwrap();
-            let destination = conversations_path.join(name.clone());
-            let destination = match destination.to_str() {
-                Some(s) => {
-                    if flags.load_conversation.len() > 0 {
-                        format!("{}", flags.load_conversation)
-                    } else {
-                        format!("{}.json", s)
-                    }
-                }
-                _ => panic!(
-                    "Failed to convert path to string: {:?} + {:?}",
-                    conversations_path, name
-                ),
-            };
-
-            match std::fs::write(destination.clone(), messages_json) {
-                Ok(_) => {
-                    info!("Conversation saved to {}", destination);
-                }
-                Err(e) => {
-                    info!("Error saving messages: {}", e);
-                }
-            }
-        }
     }
 
     Ok(())
