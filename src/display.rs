@@ -1,5 +1,5 @@
 use copypasta::{ClipboardContext, ClipboardProvider};
-use std::io::Read;
+use std::io::{BufRead, Read};
 
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -826,7 +826,7 @@ pub fn conversation_search(
     let conversation_path = crate::config::get_conversations_dir();
 
     let mut conversations = Vec::new();
-    for file in std::fs::read_dir(crate::config::get_conversations_dir())? {
+    for file in std::fs::read_dir(conversation_path.clone())? {
         let file = file?;
         if file.path().is_file() {
             conversations.push(network::DeweyResponseItem {
@@ -843,10 +843,14 @@ pub fn conversation_search(
         search_max_width: 0,
         search_content: String::new(),
         search_cursor: 0,
-        search_results: conversations,
+        search_results: conversations.clone(),
         results_state: ListState::default(),
         next_window: WindowView::Directory,
     };
+
+    let mut last_call = std::time::Instant::now();
+    let mut pending_search = false;
+    let mut filtered_results = Vec::new();
 
     let mut chosen_conversation = String::new();
 
@@ -864,16 +868,77 @@ pub fn conversation_search(
 
             state.search_max_width = main_layout[0].width as usize;
 
-            let list = List::new(
+            if state.search_content.len() == 0 {
+                filtered_results = Vec::new();
+            }
+
+            // this _needs_ to be multithreaded
+            let results = if pending_search
+                && std::time::Instant::now() - last_call > std::time::Duration::from_millis(500)
+            {
+                pending_search = false;
+                last_call = std::time::Instant::now();
+
+                filtered_results = state
+                    .search_results
+                    .iter()
+                    .filter_map(|response| {
+                        let path = conversation_path.join(response.filepath.clone());
+                        let file = match std::fs::File::open(path.clone()) {
+                            Ok(f) => Some(f),
+                            Err(e) => {
+                                error!("error opening file {}: {}", path.to_str().unwrap(), e);
+                                None
+                            }
+                        };
+
+                        if file.is_none() {
+                            return None;
+                        }
+
+                        let file = file.unwrap();
+                        let mut reader = std::io::BufReader::new(file);
+                        let mut buffer = Vec::new();
+
+                        let mut offset = 0;
+                        loop {
+                            buffer.resize(state.search_content.len(), 0);
+                            let bytes_read = reader.read(&mut buffer).unwrap();
+                            if bytes_read == 0 {
+                                break;
+                            }
+
+                            offset += bytes_read;
+
+                            buffer.truncate(bytes_read);
+
+                            if let Ok(text) = String::from_utf8(buffer.clone()) {
+                                if text.contains(&state.search_content) {
+                                    return Some(response.filepath.clone());
+                                }
+                            }
+                        }
+
+                        None
+                    })
+                    .collect::<Vec<String>>();
+
+                filtered_results.clone()
+            } else if state.search_content.len() > 0 {
+                filtered_results.clone()
+            } else {
                 state
                     .search_results
                     .iter()
-                    .map(|response| response.filepath.clone()),
-            )
-            .block(Block::bordered().title("File Results"))
-            .highlight_style(Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD))
-            .highlight_symbol(">")
-            .repeat_highlight_symbol(true);
+                    .map(|response| response.filepath.clone())
+                    .collect::<Vec<String>>()
+            };
+
+            let list = List::new(results.clone())
+                .block(Block::bordered().title("Conversations"))
+                .highlight_style(Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD))
+                .highlight_symbol(">")
+                .repeat_highlight_symbol(true);
 
             frame.render_widget(
                 Paragraph::new(state.search_content.clone())
@@ -887,7 +952,7 @@ pub fn conversation_search(
 
             match state.results_state.selected() {
                 Some(i) => {
-                    let selected = conversation_path.join(state.search_results[i].filepath.clone());
+                    let selected = conversation_path.join(results[i].clone());
                     let file = std::fs::File::open(selected.clone());
                     if file.is_err() {
                         lines.push(Line::from(Span::styled(
@@ -1038,6 +1103,8 @@ pub fn conversation_search(
                                         if state.search_cursor < state.search_max_width {
                                             state.search_cursor += 1;
                                         }
+
+                                        pending_search = true;
                                     }
                                 }
                                 KeyCode::Backspace => {
@@ -1047,6 +1114,7 @@ pub fn conversation_search(
                                             .drain(state.search_cursor - 1..state.search_cursor);
 
                                         state.search_cursor -= 1;
+                                        pending_search = true;
                                     }
                                 }
                                 KeyCode::Left => {
