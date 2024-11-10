@@ -6,7 +6,7 @@ mod network;
 use crate::logger::Logger;
 
 struct Flags {
-    generate_name: bool,
+    save_conversation: bool,
     api: String,
     adhoc: String,
     help: bool,
@@ -17,7 +17,7 @@ struct Flags {
 impl Flags {
     fn new() -> Self {
         Self {
-            generate_name: false,
+            save_conversation: true,
             api: "anthropic".to_string(),
             adhoc: String::new(),
             help: false,
@@ -30,7 +30,7 @@ impl Flags {
 fn man() {
     println!("Usage: tllm [OPTIONS] [TEXT]");
     println!("\nOptions:");
-    println!("\t-n\t\tDo not generate a name for the conversation file");
+    println!("\t-n\t\tDo not save the file");
     println!("\t-a API\t\tUse the specified API (anthropic, openai)");
     println!("\t-i TEXT\t\tUse the specified text as an ad-hoc prompt");
     println!("\t-h\t\tDisplay this help message");
@@ -45,7 +45,7 @@ fn parse_flags() -> Result<Flags, Box<dyn std::error::Error>> {
     for i in 1..args.len() {
         match args[i].as_str() {
             "-n" => {
-                flags.generate_name = !flags.generate_name;
+                flags.save_conversation = !flags.save_conversation;
             }
             "-a" => {
                 if i + 1 < args.len() {
@@ -180,24 +180,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         println!("{}\n\n", content);
 
-        chat_history.push(response);
+        if flags.save_conversation {
+            chat_history.push(response);
 
-        let messages_json = serde_json::to_string(&chat_history).unwrap();
-        let destination = conversations_path.join(now.clone());
-        let destination = match destination.to_str() {
-            Some(s) => format!("{}.json", s),
-            _ => panic!(
-                "Failed to convert path to string: {:?} + {:?}",
-                conversations_path, now
-            ),
-        };
+            let messages_json = serde_json::to_string(&chat_history).unwrap();
+            let destination = conversations_path.join(now.clone());
+            let destination = match destination.to_str() {
+                Some(s) => format!("{}.json", s),
+                _ => panic!(
+                    "Failed to convert path to string: {:?} + {:?}",
+                    conversations_path, now
+                ),
+            };
 
-        match std::fs::write(destination.clone(), messages_json) {
-            Ok(_) => {
-                info!("Conversation saved to {}", destination);
-            }
-            Err(e) => {
-                info!("Error saving messages: {}", e);
+            match std::fs::write(destination.clone(), messages_json) {
+                Ok(_) => {
+                    info!("Conversation saved to {}", destination);
+                }
+                Err(e) => {
+                    info!("Error saving messages: {}", e);
+                }
             }
         }
     } else {

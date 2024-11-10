@@ -1,5 +1,5 @@
 use copypasta::{ClipboardContext, ClipboardProvider};
-use std::io::{BufRead, Read};
+use std::io::Read;
 
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -61,8 +61,35 @@ impl WrappedText {
         }
     }
 
-    pub fn insert(&mut self, substring: &str, line: usize, column: usize) {
+    // no idea what these +1s are for lol
+    pub fn next_whitespace_distance(&self, line: usize, column: usize) -> usize {
         let offset = self.get_flat(line, column + 1, false);
+        if let Some(rest) = self.content.get(offset..) {
+            match rest.find(char::is_whitespace) {
+                Some(d) => d,
+                None => rest.len(),
+            }
+        } else {
+            0
+        }
+    }
+
+    pub fn prev_whitespace_distance(&self, line: usize, column: usize) -> usize {
+        let offset = self.get_flat(line, column + 1, false);
+        if let Some(rest) = self.content.get(..offset) {
+            match rest.rfind(char::is_whitespace) {
+                Some(d) => offset - d,
+                None => rest.len(),
+            }
+        } else {
+            0
+        }
+    }
+
+    pub fn insert(&mut self, substring: &str, line: usize, column: usize) {
+        let offset = self.get_flat(line, column + if line > 0 { 1 } else { 0 }, false);
+
+        info!("line, col, offset: {}, {}, {} ", line, column, offset);
 
         let sanitized = substring.replace("\t", "    ");
 
@@ -296,6 +323,8 @@ pub fn chat(
                     cursor.0 = page_check.window_size.1 - 3;
                 } else if cursor.0 == 0 && state.pending_page_up && page_check.page > 0 {
                     page_check.page -= 1;
+                } else if page_check.line_lengths.len() < page_check.window_size.1 - 2 {
+                    page_check.page = 0;
                 }
 
                 state.pending_page_up = false;
@@ -532,7 +561,22 @@ pub fn chat(
                                             state.input_cursor.1,
                                         );
 
-                                        state.input_cursor.1 += 1;
+                                        // TODO: structs with row/col/width/height values instead
+                                        //       of these stupid fucking tuples
+                                        if state.input_cursor.1
+                                            >= state.input_wrapped.window_size.0 - 3
+                                        {
+                                            state.input_wrapped.insert(
+                                                &"\n".to_string(),
+                                                state.input_cursor.0 + state.input_wrapped.page,
+                                                state.input_cursor.1,
+                                            );
+
+                                            state.input_cursor.0 += 1;
+                                            state.input_cursor.1 = 1;
+                                        } else {
+                                            state.input_cursor.1 += 1;
+                                        }
                                     }
 
                                     state.pending_changes = true;
@@ -554,12 +598,49 @@ pub fn chat(
                                     }
                                 }
                                 KeyCode::Left => {
+                                    if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                        state.input_cursor.1 -= std::cmp::min(
+                                            state.input_cursor.1,
+                                            state.input_wrapped.prev_whitespace_distance(
+                                                state.input_cursor.0,
+                                                state.input_cursor.1,
+                                            ),
+                                        );
+
+                                        if state.input_cursor.0 > 0 && state.input_cursor.1 == 0 {
+                                            state.input_cursor.0 -= 1;
+
+                                            // this gets caught by the cursor clamping
+                                            state.input_cursor.1 = usize::MAX;
+                                        }
+                                    }
+
                                     // underflow
                                     if state.input_cursor.1 > 0 {
                                         state.input_cursor.1 -= 1;
                                     }
                                 }
                                 KeyCode::Right => {
+                                    if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                        state.input_cursor.1 +=
+                                            state.input_wrapped.next_whitespace_distance(
+                                                state.input_cursor.0,
+                                                state.input_cursor.1,
+                                            );
+
+                                        if state.input_cursor.0 + state.input_wrapped.page
+                                            < state.input_wrapped.line_lengths.len()
+                                            && state.input_cursor.1
+                                                >= state.input_wrapped.line_lengths[state
+                                                    .input_cursor
+                                                    .0
+                                                    + state.input_wrapped.page]
+                                        {
+                                            state.input_cursor.0 += 1;
+                                            state.input_cursor.1 = 1;
+                                        }
+                                    }
+
                                     state.input_cursor.1 += 1;
                                 }
                                 KeyCode::Up => {
@@ -900,15 +981,12 @@ pub fn conversation_search(
                         let mut reader = std::io::BufReader::new(file);
                         let mut buffer = Vec::new();
 
-                        let mut offset = 0;
                         loop {
                             buffer.resize(state.search_content.len(), 0);
                             let bytes_read = reader.read(&mut buffer).unwrap();
                             if bytes_read == 0 {
                                 break;
                             }
-
-                            offset += bytes_read;
 
                             buffer.truncate(bytes_read);
 
