@@ -421,7 +421,7 @@ pub fn chat(
             Err(e) => panic!("{}", e),
         };
 
-        if event::poll(std::time::Duration::from_millis(25))? {
+        if event::poll(std::time::Duration::from_millis(5))? {
             match event::read() {
                 Ok(Event::Key(key)) => {
                     if key.kind == KeyEventKind::Press {

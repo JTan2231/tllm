@@ -86,6 +86,17 @@ fn build_request(params: &RequestParams) -> String {
                 }).collect::<Vec<serde_json::Value>>(),
             "stream": params.stream,
         }),
+        "groq" => serde_json::json!({
+            "model": params.model,
+            "messages": params.messages.iter()
+                .map(|message| {
+                    serde_json::json!({
+                        "role": message.message_type.to_string(),
+                        "content": message.content
+                    })
+                }).collect::<Vec<serde_json::Value>>(),
+            "stream": params.stream,
+        }),
         "anthropic" => serde_json::json!({
             "model": params.model,
             "messages": params.messages.iter().map(|message| {
@@ -125,6 +136,11 @@ fn build_request(params: &RequestParams) -> String {
 
     let (auth_string, api_version, path) = match params.provider.as_str() {
         "openai" => (
+            format!("Authorization: Bearer {}\r\n", params.authorization_token),
+            "\r\n".to_string(),
+            params.path.clone(),
+        ),
+        "groq" => (
             format!("Authorization: Bearer {}\r\n", params.authorization_token),
             "\r\n".to_string(),
             params.path.clone(),
@@ -183,6 +199,31 @@ fn get_openai_request_params(
         stream,
         authorization_token: env::var("OPENAI_API_KEY")
             .expect("OPENAI_API_KEY environment variable not set"),
+        max_tokens: None,
+        system_prompt: None,
+    }
+}
+
+// this is basically a copy of the openai_request_params
+fn get_groq_request_params(
+    system_prompt: String,
+    chat_history: &Vec<Message>,
+    stream: bool,
+) -> RequestParams {
+    RequestParams {
+        provider: "groq".to_string(),
+        host: "api.groq.com".to_string(),
+        path: "/openai/v1/chat/completions".to_string(),
+        port: 443,
+        messages: vec![Message::new(MessageType::System, system_prompt.clone())]
+            .iter()
+            .chain(chat_history.iter())
+            .cloned()
+            .collect::<Vec<Message>>(),
+        model: "llama-3.2-90b-text-preview".to_string(),
+        stream,
+        authorization_token: env::var("GROQ_API_KEY")
+            .expect("GRQO_API_KEY environment variable not set"),
         max_tokens: None,
         system_prompt: None,
     }
@@ -361,6 +402,7 @@ pub fn prompt_stream(
     let params = match api.as_str() {
         "anthropic" => get_anthropic_request_params(system_prompt.clone(), chat_history, true),
         "openai" => get_openai_request_params(system_prompt.clone(), chat_history, true),
+        "groq" => get_groq_request_params(system_prompt.clone(), chat_history, true),
         _ => panic!("Invalid API does not yet support streaming: {}", api),
     };
 
@@ -380,6 +422,7 @@ pub fn prompt_stream(
     let response = match api.as_str() {
         "anthropic" => process_anthropic_stream(stream, &tx),
         "openai" => process_openai_stream(stream, &tx),
+        "groq" => process_openai_stream(stream, &tx),
         _ => panic!("Invalid API: {}--how'd this get here?", api),
     };
 
@@ -403,6 +446,7 @@ pub fn prompt(
         "anthropic" => get_anthropic_request_params(system_prompt.clone(), chat_history, false),
         "openai" => get_openai_request_params(system_prompt.clone(), chat_history, false),
         "gemini" => get_gemini_request_params(system_prompt.clone(), chat_history, false),
+        "groq" => get_groq_request_params(system_prompt.clone(), chat_history, false),
         _ => panic!("Invalid API: {}--how'd this get here?", api),
     };
     let stream = TcpStream::connect((params.host.clone(), params.port))?;
@@ -482,6 +526,7 @@ pub fn prompt(
 
     let mut content = match api.as_str() {
         "openai" => response_json["choices"][0]["message"]["content"].to_string(),
+        "groq" => response_json["choices"][0]["message"]["content"].to_string(),
         "anthropic" => response_json["content"][0]["text"].to_string(),
         "gemini" => response_json["candidates"][0]["content"]["parts"][0]["text"].to_string(),
         _ => {
