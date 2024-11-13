@@ -49,7 +49,7 @@ fn parse_flags() -> Result<Flags, Box<dyn std::error::Error>> {
             }
             "-a" => {
                 if i + 1 < args.len() {
-                    flags.api = args[i + 1].clone();
+                    flags.api = args[i + 1].trim().to_string();
                 } else {
                     man();
                     return Err("API flag -a requires an argument".into());
@@ -98,7 +98,7 @@ fn parse_flags() -> Result<Flags, Box<dyn std::error::Error>> {
         "gemini" => {}
         "groq" => {}
         _ => {
-            error!("Invalid API: {}", flags.api);
+            error!("Invalid API flag: {}", flags.api);
             return Err("Invalid API".into());
         }
     }

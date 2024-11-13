@@ -89,8 +89,6 @@ impl WrappedText {
     pub fn insert(&mut self, substring: &str, line: usize, column: usize) {
         let offset = self.get_flat(line, column + if line > 0 { 1 } else { 0 }, false);
 
-        info!("line, col, offset: {}, {}, {} ", line, column, offset);
-
         let sanitized = substring.replace("\t", "    ");
 
         if offset >= self.content.len() {
@@ -177,6 +175,7 @@ pub struct ChatState {
     pending_page_up: bool,
     pending_chat_update: String,
     pending_deletions: usize,
+    last_message_instant: std::time::Instant,
     next_window: WindowView,
 }
 
@@ -281,6 +280,7 @@ pub fn chat(
         pending_page_up: false,
         pending_chat_update: String::new(),
         pending_deletions: 0,
+        last_message_instant: std::time::Instant::now() - std::time::Duration::from_secs(60),
         next_window: WindowView::Chat,
     };
 
@@ -416,12 +416,19 @@ pub fn chat(
 
                 state.pending_chat_update = message;
                 state.chat_cursor.0 = state.chat_wrapped.line_lengths.len();
+                state.last_message_instant = std::time::Instant::now();
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(e) => panic!("{}", e),
         };
 
-        if event::poll(std::time::Duration::from_millis(5))? {
+        if {
+            if (std::time::Instant::now() - state.last_message_instant).as_millis() < 5000 {
+                event::poll(std::time::Duration::from_millis(5))?
+            } else {
+                true
+            }
+        } {
             match event::read() {
                 Ok(Event::Key(key)) => {
                     if key.kind == KeyEventKind::Press {
@@ -461,6 +468,8 @@ pub fn chat(
                                             message_type: network::MessageType::Assistant,
                                             content: String::new(),
                                         });
+
+                                        state.last_message_instant = std::time::Instant::now();
 
                                         let messages = state.chat_messages.clone();
                                         let prompt = system_prompt.to_string();
