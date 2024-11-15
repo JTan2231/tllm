@@ -208,11 +208,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     } else {
+        let save_path = if std::path::Path::new(&flags.load_conversation).exists() {
+            flags.load_conversation
+        } else {
+            let destination = conversations_path.join(now.clone());
+            match destination.to_str() {
+                Some(s) => format!("{}.json", s),
+                _ => panic!(
+                    "Failed to convert path to string: {:?} + {:?}",
+                    conversations_path, now
+                ),
+            }
+        };
+
         match display::display_manager(
             display::WindowView::Chat,
             &system_prompt,
             &flags.api,
-            flags.load_conversation.clone(),
+            save_path,
         ) {
             Ok(_) => {}
             Err(e) => panic!("error in display manager: {}", e),

@@ -682,7 +682,7 @@ pub fn chat(
             info!("Conversation saved to {}", conversation_path);
         }
         Err(e) => {
-            info!("Error saving messages: {}", e);
+            info!("Error saving messages to {}: {}", conversation_path, e);
         }
     }
 
