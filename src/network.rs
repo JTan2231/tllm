@@ -2,7 +2,7 @@ use native_tls::TlsStream;
 use std::env;
 use std::io::BufRead;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 
 use crate::logger::Logger;
 use crate::{error, info};
@@ -393,6 +393,19 @@ fn process_anthropic_stream(
     Ok(full_message)
 }
 
+fn connect_https(host: &str, port: u16) -> native_tls::TlsStream<std::net::TcpStream> {
+    let addr = (host, port)
+        .to_socket_addrs()
+        .unwrap()
+        .find(|addr| addr.is_ipv4())
+        .expect("No IPv4 address found");
+
+    let stream = TcpStream::connect(&addr).unwrap();
+
+    let connector = native_tls::TlsConnector::new().expect("TLS connector failed to create");
+    connector.connect(host, stream).unwrap()
+}
+
 pub fn prompt_stream(
     system_prompt: String,
     chat_history: &Vec<Message>,
@@ -406,19 +419,16 @@ pub fn prompt_stream(
         _ => panic!("Invalid API does not yet support streaming: {}", api),
     };
 
-    let stream = TcpStream::connect((params.host.clone(), params.port)).expect("Failed to connect");
-
-    let connector = native_tls::TlsConnector::new().expect("Failed to create TLS connector");
-    let mut stream = connector
-        .connect(&params.host, stream)
-        .expect("Failed to establish TLS connection");
-
+    // TODO: need error handling littered throughout here
+    //       how can we bubble errors back up to the display + show them properly?
     let request = build_request(&params);
+    let mut stream = connect_https(&params.host, params.port);
     stream
         .write_all(request.as_bytes())
         .expect("Failed to write to stream");
     stream.flush().expect("Failed to flush stream");
 
+    info!("stream written");
     let response = match api.as_str() {
         "anthropic" => process_anthropic_stream(stream, &tx),
         "openai" => process_openai_stream(stream, &tx),
@@ -449,14 +459,9 @@ pub fn prompt(
         "groq" => get_groq_request_params(system_prompt.clone(), chat_history, false),
         _ => panic!("Invalid API: {}--how'd this get here?", api),
     };
-    let stream = TcpStream::connect((params.host.clone(), params.port))?;
-
-    let connector = native_tls::TlsConnector::new().expect("Failed to create TLS connector");
-    let mut stream = connector
-        .connect(&params.host, stream)
-        .expect("Failed to establish TLS connection");
 
     let request = build_request(&params);
+    let mut stream = connect_https(&params.host, params.port);
     stream.write_all(request.as_bytes())?;
     stream.flush()?;
 

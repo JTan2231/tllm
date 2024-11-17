@@ -210,6 +210,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         let save_path = if std::path::Path::new(&flags.load_conversation).exists() {
             flags.load_conversation
+        } else if !flags.save_conversation {
+            String::new()
         } else {
             let destination = conversations_path.join(now.clone());
             match destination.to_str() {

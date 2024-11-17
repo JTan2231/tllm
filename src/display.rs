@@ -676,13 +676,15 @@ pub fn chat(
         }
     }
 
-    let messages_json = serde_json::to_string(&state.chat_messages).unwrap();
-    match std::fs::write(conversation_path, messages_json) {
-        Ok(_) => {
-            info!("Conversation saved to {}", conversation_path);
-        }
-        Err(e) => {
-            info!("Error saving messages to {}: {}", conversation_path, e);
+    if conversation_path.len() > 0 {
+        let messages_json = serde_json::to_string(&state.chat_messages).unwrap();
+        match std::fs::write(conversation_path, messages_json) {
+            Ok(_) => {
+                info!("Conversation saved to {}", conversation_path);
+            }
+            Err(e) => {
+                info!("Error saving messages to {}: {}", conversation_path, e);
+            }
         }
     }
 
