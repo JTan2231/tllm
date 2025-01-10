@@ -16,8 +16,8 @@ impl Logger {
                     file: std::fs::OpenOptions::new()
                         .create(true)
                         .append(true)
-                        .open(filename)
-                        .expect("Failed to open log file"),
+                        .open(filename.clone())
+                        .expect(&format!("Failed to open log file: {}", filename)),
                 });
             });
 

@@ -62,11 +62,12 @@ pub fn setup() {
 
     let conversations_path = local_path.join("conversations");
     let logging_path = local_path.join("logs");
+    create_if_nonexistent(&logging_path);
+
     crate::logger::Logger::init(format!("{}/debug.log", logging_path.to_str().unwrap()));
 
     create_if_nonexistent(&local_path);
     create_if_nonexistent(&config_path);
 
     create_if_nonexistent(&conversations_path);
-    create_if_nonexistent(&logging_path);
 }
