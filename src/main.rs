@@ -1,237 +1,243 @@
-mod config;
-mod display;
-mod logger;
-mod network;
+use std::env;
+use std::fs;
+use std::process::Command;
 
-use crate::logger::Logger;
+use chamber_common::{get_local_dir, get_root_dir};
+use clap::{ArgGroup, Parser};
 
-struct Flags {
-    save_conversation: bool,
-    api: String,
-    adhoc: String,
-    help: bool,
-    system_prompt: String,
-    load_conversation: String,
-}
+mod sql;
 
-impl Flags {
-    fn new() -> Self {
-        Self {
-            save_conversation: true,
-            api: "anthropic".to_string(),
-            adhoc: String::new(),
-            help: false,
-            system_prompt: String::new(),
-            load_conversation: String::new(),
-        }
+fn create_if_nonexistent(path: &std::path::PathBuf) {
+    if !path.exists() {
+        match std::fs::create_dir_all(&path) {
+            Ok(_) => (),
+            Err(e) => panic!("Failed to create directory: {:?}, {}", path, e),
+        };
     }
 }
 
-fn man() {
-    println!("Usage: tllm [OPTIONS] [TEXT]");
-    println!("\nOptions:");
-    println!("\t-n\t\tDo not save the file");
-    println!("\t-a API\t\tUse the specified API (anthropic, openai)");
-    println!("\t-i TEXT\t\tUse the specified text as an ad-hoc prompt");
-    println!("\t-h\t\tDisplay this help message");
-    println!("\t-l FILE\t\tLoad a conversation from the specified file");
-    println!("\t-s TEXT or FILE\t\tUse the specified text/file as the system prompt");
-}
-
-fn parse_flags() -> Result<Flags, Box<dyn std::error::Error>> {
-    let mut flags = Flags::new();
-    let args: Vec<String> = std::env::args().collect();
-
-    for i in 1..args.len() {
-        match args[i].as_str() {
-            "-n" => {
-                flags.save_conversation = !flags.save_conversation;
-            }
-            "-a" => {
-                if i + 1 < args.len() {
-                    flags.api = args[i + 1].trim().to_string();
-                } else {
-                    man();
-                    return Err("API flag -a requires an argument".into());
-                }
-            }
-            "-i" => {
-                if i + 1 < args.len() {
-                    flags.adhoc = args[i + 1].clone();
-                } else {
-                    man();
-                    return Err("API flag -i requires an argument".into());
-                }
-            }
-            "-h" => {
-                flags.help = true;
-            }
-            "-l" => {
-                if i + 1 < args.len() {
-                    let filepath = std::path::PathBuf::from(args[i + 1].clone());
-                    if !filepath.exists() {
-                        error!("File does not exist: {:?}", filepath);
-                        return Err("File does not exist".into());
-                    }
-
-                    flags.load_conversation = args[i + 1].clone();
-                } else {
-                    man();
-                    return Err("API flag -l requires a filepath argument".into());
-                }
-            }
-            "-s" => {
-                if i + 1 < args.len() {
-                    flags.system_prompt = args[i + 1].clone();
-                } else {
-                    man();
-                    return Err("API flag -s requires an argument".into());
-                }
-            }
-            _ => (),
-        }
-    }
-
-    match flags.api.as_str() {
-        "anthropic" => {}
-        "openai" => {}
-        "gemini" => {}
-        "groq" => {}
-        _ => {
-            error!("Invalid API flag: {}", flags.api);
-            return Err("Invalid API".into());
-        }
-    }
-
-    Ok(flags)
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let now: String = chrono::Local::now().timestamp_micros().to_string();
-    config::setup();
-
-    let config_path = config::get_config_dir();
-    let conversations_path = config::get_conversations_dir();
-
-    let flags = parse_flags()?;
-
-    let system_prompt = match flags.system_prompt.len() {
-        0 => {
-            let system_prompt_path = config_path.join("system_prompt");
-            if system_prompt_path.exists() {
-                match std::fs::read_to_string(system_prompt_path) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!("Failed to read system prompt: {}", e);
-                        String::new()
-                    }
-                }
-            } else {
-                String::new()
-            }
-        }
-        _ => {
-            let system_prompt_path = std::path::PathBuf::from(flags.system_prompt.clone());
-            if system_prompt_path.exists() {
-                match std::fs::read_to_string(system_prompt_path) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!("Failed to read system prompt: {}", e);
-                        String::new()
-                    }
-                }
-            } else {
-                flags.system_prompt.clone()
-            }
+// Normally this would return an error
+// but if this fails then the app can't run correctly
+fn setup() {
+    // TODO: better path config handling
+    let home_dir = match std::env::var("HOME") {
+        Ok(d) => d,
+        Err(e) => {
+            panic!("Error getting home variable: {}", e);
         }
     };
 
-    if flags.help {
-        man();
+    let root = if cfg!(dev) {
+        format!("{}/.local/tllm-dev", home_dir)
+    } else {
+        format!("{}/.local/tllm", home_dir)
+    };
+
+    chamber_common::Workspace::new(&root);
+
+    create_if_nonexistent(&get_local_dir());
+    create_if_nonexistent(&get_root_dir().join("logs"));
+
+    let log_name = if cfg!(dev) {
+        "debug".to_string()
+    } else {
+        format!(
+            "{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_micros()
+        )
+    };
+
+    // TODO: proper logging, obviously
+    chamber_common::Logger::init(
+        get_root_dir()
+            .join("logs")
+            .join(format!("{}.log", log_name))
+            .to_str()
+            .unwrap(),
+    );
+}
+
+fn user_editor() -> std::io::Result<()> {
+    let temp_file = "temp_input.txt";
+
+    let editor = env::var("EDITOR").unwrap_or_else(|_| "vim".to_string());
+
+    let status = Command::new(&editor).arg(temp_file).status()?;
+
+    if !status.success() {
+        println!("Editor command failed!");
         return Ok(());
     }
 
-    match flags.api.as_str() {
-        "anthropic" => match std::env::var("ANTHROPIC_API_KEY") {
-            Ok(_) => (),
-            Err(_) => panic!("ANTHROPIC_API_KEY environment variable not set"),
-        },
-        "openai" => match std::env::var("OPENAI_API_KEY") {
-            Ok(_) => (),
-            Err(_) => panic!("OPENAI_API_KEY environment variable not set"),
-        },
-        "gemini" => match std::env::var("GEMINI_API_KEY") {
-            Ok(_) => (),
-            Err(_) => panic!("GEMINI_API_KEY environment variable not set"),
-        },
-        "groq" => match std::env::var("GROQ_API_KEY") {
-            Ok(_) => (),
-            Err(_) => panic!("GROQ_API_KEY environment variable not set"),
-        },
-        _ => {}
-    }
+    match fs::read_to_string(temp_file) {
+        Ok(contents) => {
+            if contents.trim().is_empty() {
+                println!("File is empty!");
+            } else {
+                println!("File contents:");
+                println!("{}", contents);
 
-    if flags.adhoc.len() > 0 {
-        let adhoc = if std::path::PathBuf::from(&flags.adhoc).exists() {
-            std::fs::read_to_string(flags.adhoc.clone())?
-        } else {
-            flags.adhoc.clone()
-        };
-
-        let mut chat_history = vec![network::Message::new(network::MessageType::User, adhoc)];
-
-        let response = network::prompt(&flags.api, &system_prompt, &chat_history)?;
-        let content = response.content.replace("\\n", "\n");
-
-        println!("{}\n\n", content);
-
-        if flags.save_conversation {
-            chat_history.push(response);
-
-            let messages_json = serde_json::to_string(&chat_history).unwrap();
-            let destination = conversations_path.join(now.clone());
-            let destination = match destination.to_str() {
-                Some(s) => format!("{}.json", s),
-                _ => panic!(
-                    "Failed to convert path to string: {:?} + {:?}",
-                    conversations_path, now
-                ),
-            };
-
-            match std::fs::write(destination.clone(), messages_json) {
-                Ok(_) => {
-                    info!("Conversation saved to {}", destination);
-                }
-                Err(e) => {
-                    info!("Error saving messages: {}", e);
-                }
+                let word_count = contents.split_whitespace().count();
+                println!("Word count: {}", word_count);
             }
         }
-    } else {
-        let save_path = if std::path::Path::new(&flags.load_conversation).exists() {
-            flags.load_conversation
-        } else if !flags.save_conversation {
-            String::new()
-        } else {
-            let destination = conversations_path.join(now.clone());
-            match destination.to_str() {
-                Some(s) => format!("{}.json", s),
-                _ => panic!(
-                    "Failed to convert path to string: {:?} + {:?}",
-                    conversations_path, now
-                ),
-            }
-        };
+        Err(e) => {
+            println!("Error reading file: {}", e);
+        }
+    }
 
-        match display::display_manager(
-            display::WindowView::Chat,
-            &system_prompt,
-            &flags.api,
-            save_path,
-        ) {
-            Ok(_) => {}
-            Err(e) => panic!("error in display manager: {}", e),
-        };
+    // Clean up: remove the temporary file
+    fs::remove_file(temp_file)?;
+
+    Ok(())
+}
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+#[command(group(
+    ArgGroup::new("commands")
+        .args(["page", "page_with_id", "editor"])
+        .required(false)
+))]
+struct Cli {
+    /// Message to send to the LLM
+    #[arg(index = 1)]
+    message: Option<String>,
+
+    /// Page through the last conversation
+    #[arg(short = 'p')]
+    page: bool,
+
+    /// Page through the conversation with the given ID
+    #[arg(short = 'P')]
+    page_with_id: Option<String>,
+
+    /// Send a message using the system editor
+    #[arg(short = 'e')]
+    editor: bool,
+
+    /// Choose which LLM provider to use (anthropic or openai)
+    #[arg(short = 'a')]
+    #[arg(value_parser = parse_provider)]
+    provider: Option<Provider>,
+}
+
+#[derive(Debug, Clone)]
+enum Provider {
+    Anthropic,
+    OpenAI,
+}
+
+fn parse_provider(s: &str) -> Result<Provider, String> {
+    match s.to_lowercase().as_str() {
+        "anthropic" => Ok(Provider::Anthropic),
+        "openai" => Ok(Provider::OpenAI),
+        _ => Err(format!(
+            "Invalid provider: {}. Must be 'anthropic' or 'openai'",
+            s
+        )),
+    }
+}
+
+/// Commands:
+/// - Default usage: tllm <message>
+///   - This just spits the response out into the terminal
+/// - p
+///   - Page through the last conversation
+/// - P <conversation id>
+///   - Page through the conversation with the given ID
+/// - e
+///   - Send a message with whatever editor is set in $EDITOR
+/// - l [TODO]
+///   - List saved conversations
+///
+///   - NOTE: If you are responding to a conversation (e.g., -ep or -eP),
+///           the conversation will display in the editor
+///
+/// - a <anthropic|openai>
+///   - Choose which LLM provider to use
+///   - Assumes that the appropriate API key is set:
+///     - `anthropic` -- `$ANTHROPIC_API_kEY`
+///     - `openai`    -- `$OPENAI_API_KEY`
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    setup();
+    let mut wire = wire::Wire::new(None, None, Some("http://localhost:8000".to_string()))
+        .await
+        .unwrap();
+
+    let args = std::env::args();
+
+    let cli = Cli::parse();
+
+    // Example usage of the parsed arguments
+    match (cli.page, cli.page_with_id, cli.editor, cli.message) {
+        (true, None, false, None) => {
+            // TODO: Handle 'p' command
+        }
+        (false, Some(id), false, None) => {
+            // TODO: Handle 'P' command with ID
+        }
+        (false, None, true, None) => {
+            // TODO: Handle 'e' command
+        }
+        (false, None, false, Some(message)) => {
+            // Default to GPT4o if no provider is specified
+            let api = if let Some(provider) = cli.provider {
+                match provider {
+                    Provider::Anthropic => {
+                        wire::types::API::Anthropic(wire::types::AnthropicModel::Claude35Sonnet)
+                    }
+                    Provider::OpenAI => wire::types::API::OpenAI(wire::types::OpenAIModel::GPT4o),
+                }
+            } else {
+                wire::types::API::OpenAI(wire::types::OpenAIModel::GPT4o)
+            };
+
+            // If the message is a filepath, try and load the contents of the file as the chat
+            // message
+            let message = {
+                let path = std::path::PathBuf::try_from(message.clone());
+                if path.is_ok() {
+                    match std::fs::read_to_string(path.unwrap()) {
+                        Ok(c) => c,
+                        Err(_) => message,
+                    }
+                } else {
+                    message
+                }
+            };
+
+            let messages = vec![wire::types::Message {
+                message_type: wire::types::MessageType::User,
+                content: message,
+                api: api.clone(),
+                system_prompt: String::new(),
+            }];
+
+            let response = match wire.prompt(api, "", &messages).await {
+                Ok(r) => r,
+                Err(e) => {
+                    panic!("Error receiving response: {}", e);
+                }
+            };
+
+            println!("{}", response.content);
+        }
+        _ => {
+            println!("Invalid combination of arguments");
+        }
+    }
+
+    // Default case
+    // TODO: until CLI parsing is done
+    //       this will assume there is only one argument
+    for (i, arg) in args.enumerate() {
+        println!("{}, {}", i, arg);
+        if i == 1 {}
     }
 
     Ok(())
