@@ -24,6 +24,8 @@ fn create_if_nonexistent(path: &std::path::PathBuf) {
 
 // Normally this would return an error
 // but if this fails then the app can't run correctly
+//
+// TODO: the config shouldn't be in `~/.local/tllm/config/`
 fn setup() {
     // TODO: better path config handling
     let home_dir = match std::env::var("HOME") {
@@ -227,6 +229,10 @@ struct Cli {
     #[arg(index = 1)]
     message: Option<String>,
 
+    /// Path to a file containing your system prompt. This will be ignored if the path is invalid.
+    #[arg(short = 's', long)]
+    system_prompt: Option<String>,
+
     /// List saved conversations
     #[arg(short = 'l', long, conflicts_with = "load_last_conversation", action = ArgAction::SetTrue)]
     list: Option<bool>,
@@ -257,6 +263,9 @@ struct Cli {
 struct Options {
     /// Message to send to the LLM
     message: Option<String>,
+
+    /// System prompt
+    system_prompt: Option<String>,
 
     /// List saved conversations
     list: bool,
@@ -363,7 +372,8 @@ fn merge_with_config(mut cli: Cli, config_path: &std::path::PathBuf) -> Cli {
             provider,
             list,
             load_last_conversation,
-            editor
+            editor,
+            system_prompt
         );
     }
 
@@ -374,6 +384,7 @@ fn merge_with_config(mut cli: Cli, config_path: &std::path::PathBuf) -> Cli {
 fn cli_to_options(cli: Cli) -> Options {
     Options {
         message: cli.message,
+        system_prompt: cli.system_prompt,
 
         list: cli.list.unwrap_or(false),
         load_last_conversation: cli.load_last_conversation.unwrap_or(false),
@@ -424,6 +435,7 @@ async fn send_and_save_message(
     wire: &mut wire::Wire,
     db: &mut sql::Database,
     user_message: String,
+    system_prompt: &str,
     conversation_to_load: Option<String>,
     loaded_conversation: Vec<sql::Message>,
     api: wire::types::API,
@@ -438,8 +450,7 @@ async fn send_and_save_message(
                 },
                 content: m.content.clone(),
                 api: api.clone(),
-                // TODO: System prompting here? doesn't feel right
-                system_prompt: String::new(),
+                system_prompt: system_prompt.to_string(),
             })
             .collect();
 
@@ -667,6 +678,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = get_options();
 
+    let system_prompt = match cli.system_prompt {
+        Some(f) => match std::fs::read_to_string(f) {
+            Ok(c) => c,
+            Err(_) => String::new(),
+        },
+        None => String::new(),
+    };
+
     // Title (not ID!) of the target conversation to load/refer
     let conversation_to_load = match cli.list {
         true => conversation_picker(&db),
@@ -706,22 +725,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut contents_split = file_contents.split(HISTORY_SEPARATOR);
             let user_message = contents_split.next();
 
-            if user_message.is_none() || user_message.unwrap().trim().is_empty() {
-                println!("Empty input, operation aborted.");
-                return Ok(());
+            if !(user_message.is_none() || user_message.unwrap().trim().is_empty()) {
+                let user_message = user_message.unwrap().trim().to_string();
+
+                current_conversation = send_and_save_message(
+                    &mut wire,
+                    &mut db,
+                    user_message,
+                    &system_prompt,
+                    conversation_to_load.clone(),
+                    loaded_conversation,
+                    api,
+                )
+                .await;
+            } else {
+                println!("User input empty, operation aborted.");
             }
-
-            let user_message = user_message.unwrap().trim().to_string();
-
-            current_conversation = send_and_save_message(
-                &mut wire,
-                &mut db,
-                user_message,
-                conversation_to_load.clone(),
-                loaded_conversation,
-                api,
-            )
-            .await;
         }
         false => {}
     }
@@ -749,6 +768,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &mut wire,
             &mut db,
             user_message,
+            &system_prompt,
             conversation_to_load.clone(),
             loaded_conversation,
             api,
@@ -781,6 +801,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &mut wire,
                 &mut db,
                 user_message,
+                &system_prompt,
                 Some(current_conversation),
                 loaded_conversation,
                 api,
