@@ -2,8 +2,8 @@ use std::env;
 use std::fs;
 use std::process::Command;
 
-use chamber_common::{get_local_dir, get_root_dir};
-use clap::{ArgGroup, Parser};
+use chamber_common::{get_config_dir, get_local_dir, get_root_dir};
+use clap::{ArgAction, Parser};
 use tempfile::{Builder, TempPath};
 
 mod sql;
@@ -33,7 +33,7 @@ fn setup() {
         }
     };
 
-    let root = if cfg!(dev) {
+    let root = if cfg!(debug_assertions) {
         format!("{}/.local/tllm-dev", home_dir)
     } else {
         format!("{}/.local/tllm", home_dir)
@@ -43,8 +43,9 @@ fn setup() {
 
     create_if_nonexistent(&get_local_dir());
     create_if_nonexistent(&get_root_dir().join("logs"));
+    create_if_nonexistent(&get_config_dir());
 
-    let log_name = if cfg!(dev) {
+    let log_name = if cfg!(debug_assertions) {
         "debug".to_string()
     } else {
         format!(
@@ -227,15 +228,15 @@ struct Cli {
     message: Option<String>,
 
     /// List saved conversations
-    #[arg(short = 'l', long, conflicts_with = "load_last_conversation")]
-    list: bool,
+    #[arg(short = 'l', long, conflicts_with = "load_last_conversation", action = ArgAction::SetTrue)]
+    list: Option<bool>,
 
-    #[arg(short = 'L', long, conflicts_with = "list")]
-    load_last_conversation: bool,
+    #[arg(short = 'L', long, conflicts_with = "list", action = ArgAction::SetTrue)]
+    load_last_conversation: Option<bool>,
 
     /// Send a message using the system editor
-    #[arg(short = 'e')]
-    editor: bool,
+    #[arg(short = 'e', action = ArgAction::SetTrue)]
+    editor: Option<bool>,
 
     /// Choose which LLM provider to use (anthropic or openai)
     #[arg(short = 'p', long)]
@@ -243,14 +244,146 @@ struct Cli {
     provider: Option<Provider>,
 
     /// Open the current conversation in the system editor
-    #[arg(short = 'o', long)]
+    #[arg(short = 'o', long, action = ArgAction::SetTrue)]
+    open: Option<bool>,
+
+    /// Open the system editor for writing after last response
+    /// Useful for continuing a conversation without having to reissue commands
+    /// NOTE: This doesn't do anything if the editor isn't selected
+    #[arg(short = 'r', long, action = ArgAction::SetTrue)]
+    respond: Option<bool>,
+}
+
+struct Options {
+    /// Message to send to the LLM
+    message: Option<String>,
+
+    /// List saved conversations
+    list: bool,
+
+    load_last_conversation: bool,
+
+    /// Send a message using the system editor
+    editor: bool,
+
+    /// Choose which LLM provider to use (anthropic or openai)
+    provider: Option<Provider>,
+
+    /// Open the current conversation in the system editor
     open: bool,
 
     /// Open the system editor for writing after last response
     /// Useful for continuing a conversation without having to reissue commands
     /// NOTE: This doesn't do anything if the editor isn't selected
-    #[arg(short = 'r', long)]
     respond: bool,
+}
+
+trait ConfigParse {
+    fn parse_config(value: &str) -> Option<Self>
+    where
+        Self: Sized;
+}
+
+impl ConfigParse for Provider {
+    fn parse_config(value: &str) -> Option<Self> {
+        match value.to_lowercase().as_str() {
+            "anthropic" => Some(Provider::Anthropic),
+            "openai" => Some(Provider::OpenAI),
+            _ => None,
+        }
+    }
+}
+
+impl ConfigParse for bool {
+    fn parse_config(value: &str) -> Option<Self> {
+        match value.to_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Some(true),
+            "false" | "0" | "no" | "off" => Some(false),
+            _ => None,
+        }
+    }
+}
+
+impl<T: ConfigParse> ConfigParse for Option<T> {
+    fn parse_config(value: &str) -> Option<Self> {
+        Some(T::parse_config(value))
+    }
+}
+
+impl ConfigParse for String {
+    fn parse_config(value: &str) -> Option<Self> {
+        Some(value.to_string())
+    }
+}
+
+/// Shorthand for setting up parsing config key-values from the Cli struct
+/// Assumes that _all_ CLI options are configurable as defaults
+macro_rules! config_fields {
+    ($cli:expr, $key:expr, $value:expr, $($field:ident),+ $(,)?) => {
+        match $key {
+            $(
+                stringify!($field) => {
+                    $cli.$field = ConfigParse::parse_config($value).unwrap_or($cli.$field);
+                }
+            )+
+            _ => {}
+        }
+    };
+}
+
+/// Read the config file, if it exists
+/// Merge valid key=value pairs with the Cli from the CLI parse
+/// Return the consolidated struct
+/// NOTE: The CLI _always_ takes priority over the config
+fn merge_with_config(mut cli: Cli, config_path: &std::path::PathBuf) -> Cli {
+    let config_content = match std::fs::read_to_string(config_path) {
+        Ok(content) => content,
+        Err(_) => return cli,
+    };
+
+    for line in config_content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        // Split on first '=' only
+        let parts: Vec<&str> = line.splitn(2, '=').collect();
+        if parts.len() != 2 {
+            continue;
+        }
+
+        let key = parts[0].trim();
+        let value = parts[1].trim();
+
+        config_fields!(
+            cli,
+            key,
+            value,
+            provider,
+            list,
+            load_last_conversation,
+            editor
+        );
+    }
+
+    cli
+}
+
+/// This is very stupid
+fn cli_to_options(cli: Cli) -> Options {
+    Options {
+        message: cli.message,
+
+        list: cli.list.unwrap_or(false),
+        load_last_conversation: cli.load_last_conversation.unwrap_or(false),
+        editor: cli.editor.unwrap_or(false),
+
+        provider: cli.provider,
+
+        open: cli.open.unwrap_or(false),
+        respond: cli.respond.unwrap_or(false),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -385,7 +518,12 @@ async fn send_and_save_message(
         }
     };
 
-    println!("New conversation started with title {}", conversation_name);
+    if loaded_conversation.len() > 0 {
+        println!("Updated conversation {}", conversation_name);
+    } else {
+        println!("New conversation started with title {}", conversation_name);
+    }
+
     println!("---");
     println!("{}", response.content);
     println!("---");
@@ -498,6 +636,14 @@ fn conversation_picker(db: &sql::Database) -> Option<String> {
     }
 }
 
+/// Parses the CLI and conslidates that with the user-defined config defaults
+fn get_options() -> Options {
+    let cli = Cli::parse();
+    let cli = merge_with_config(cli, &get_config_dir().join("config"));
+
+    cli_to_options(cli)
+}
+
 const HISTORY_SEPARATOR: &str = "======== MESSAGE HISTORY ========";
 const MESSAGE_SEPARATOR: &str = "========";
 
@@ -519,7 +665,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(_) => panic!("Error setting up DB!"),
     };
 
-    let cli = Cli::parse();
+    let cli = get_options();
 
     // Title (not ID!) of the target conversation to load/refer
     let conversation_to_load = match cli.list {
