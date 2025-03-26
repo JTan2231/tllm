@@ -10,6 +10,9 @@ mod sql;
 
 use crate::sql::{Database, Role};
 
+// TODO: There are a lot of unwraps throughout here that should be addressed,
+//       I don't think it should be used so liberally
+
 fn create_if_nonexistent(path: &std::path::PathBuf) {
     if !path.exists() {
         match std::fs::create_dir_all(&path) {
@@ -235,13 +238,19 @@ struct Cli {
     editor: bool,
 
     /// Choose which LLM provider to use (anthropic or openai)
-    #[arg(short = 'a')]
+    #[arg(short = 'p', long)]
     #[arg(value_parser = parse_provider)]
     provider: Option<Provider>,
 
     /// Open the current conversation in the system editor
-    #[arg(short = 'o')]
+    #[arg(short = 'o', long)]
     open: bool,
+
+    /// Open the system editor for writing after last response
+    /// Useful for continuing a conversation without having to reissue commands
+    /// NOTE: This doesn't do anything if the editor isn't selected
+    #[arg(short = 'r', long)]
+    respond: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -429,11 +438,35 @@ fn conversation_picker(db: &sql::Database) -> Option<String> {
     .to_string();
 
     file_contents.push_str("\n\n");
-    for conv in conversations.iter() {
+
+    let preview_separator = format!(
+        "\n\n\n{} CONVERSATION PREVIEWS {}\n\n\n",
+        MESSAGE_SEPARATOR, MESSAGE_SEPARATOR
+    );
+
+    let mut previews = preview_separator.clone();
+
+    // .rev() for displaying the latest conversations first
+    for conv in conversations.iter().rev() {
         file_contents.push_str(&format!("nothing {}\n", conv.title));
+
+        let messages = db.get_conversation_messages(&conv.title).unwrap();
+        let messages_concatenated = &messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<String>>()
+            .join(&format!("\n\n{}\n\n", MESSAGE_SEPARATOR));
+
+        let messages_truncated =
+            &messages_concatenated[..std::cmp::min(256, messages_concatenated.len())];
+
+        previews.push_str(&format!(
+            "\n\n\n {} {} {} \n\n\n {}",
+            MESSAGE_SEPARATOR, conv.title, MESSAGE_SEPARATOR, messages_truncated
+        ));
     }
 
-    // TODO: Conversation previews
+    file_contents.push_str(&previews);
 
     let user_input = user_editor(&file_contents).unwrap();
 
@@ -442,7 +475,7 @@ fn conversation_picker(db: &sql::Database) -> Option<String> {
     for line in user_input.lines() {
         if line.starts_with("#") {
             continue;
-        } else if line.starts_with("CONVERSATION PREVIEWS") {
+        } else if line.starts_with(&preview_separator) {
             break;
         }
 
@@ -471,26 +504,8 @@ const MESSAGE_SEPARATOR: &str = "========";
 /// Commands:
 /// - Default usage: tllm <message>
 ///   - This just spits the response out into the terminal
-/// - p
-///   - Page through the last conversation
-/// - P <conversation id>
-///   - Page through the conversation with the given ID
-/// - e
-///   - Send a message with whatever editor is set in $EDITOR
-/// - l
-///   - List saved conversations + optionally load one
 ///
-///   - NOTE: If you are responding to a conversation (e.g., -ep or -eP),
-///           the conversation will display in the editor
-///
-/// - a <anthropic|openai>
-///   - Choose which LLM provider to use
-///   - Assumes that the appropriate API key is set:
-///     - `anthropic` -- `$ANTHROPIC_API_kEY`
-///     - `openai`    -- `$OPENAI_API_KEY`
-///
-/// - o
-///   - Opens the conversation (after the assistant's response) in the user's default editor
+/// See the `Cli` struct for flags
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // TODO: A lot of panics around here that need taken care of
@@ -566,7 +581,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some(message) = cli.message {
-        let api = provider_to_api(cli.provider);
+        let api = provider_to_api(cli.provider.clone());
 
         let (_, loaded_conversation) = get_conversation_string(&db, conversation_to_load.clone());
 
@@ -588,11 +603,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &mut wire,
             &mut db,
             user_message,
-            conversation_to_load,
+            conversation_to_load.clone(),
             loaded_conversation,
             api,
         )
         .await;
+    }
+
+    if cli.respond && cli.editor {
+        // We don't want this to run if no conversation has already been set
+        // If there's nothing set, that means there's no conversation to respond to
+        // and the opportunity to have started a new one has already passed
+        while current_conversation.len() > 0 {
+            let api = provider_to_api(cli.provider.clone());
+
+            let (conversation_string, loaded_conversation) =
+                get_conversation_string(&db, Some(current_conversation.clone()));
+
+            let file_contents = user_editor(&conversation_string)?;
+            let mut contents_split = file_contents.split(HISTORY_SEPARATOR);
+            let user_message = contents_split.next();
+
+            if user_message.is_none() || user_message.unwrap().trim().is_empty() {
+                println!("Empty input, operation aborted.");
+                return Ok(());
+            }
+
+            let user_message = user_message.unwrap().trim().to_string();
+
+            current_conversation = send_and_save_message(
+                &mut wire,
+                &mut db,
+                user_message,
+                Some(current_conversation),
+                loaded_conversation,
+                api,
+            )
+            .await;
+        }
     }
 
     if cli.open {
