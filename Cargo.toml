@@ -4,10 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-wire = { path = "/home/joey/rust/wire" }
-chamber-common = { path = "/home/joey/rust/chamber/common" }
+wire = { git = "https://github.com/JTan2231/wire.git" }
+chamber-common = { git = "https://github.com/JTan2231/chamber.git", package = "chamber-common" }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4.3", features = ["derive"] }
 rusqlite = { version = "0.29", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
+tempfile = "3"
+uuid = { version = "1.1", features = ["v4"] }
