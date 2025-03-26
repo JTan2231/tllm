@@ -527,12 +527,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         false => conversation_to_load,
     };
 
-    let mut current_conversation = String::new();
+    let mut current_conversation = if conversation_to_load.is_some() {
+        conversation_to_load.clone().unwrap()
+    } else {
+        String::new()
+    };
 
     // Example usage of the parsed arguments
     match cli.editor {
         true => {
-            let api = provider_to_api(cli.provider);
+            let api = provider_to_api(cli.provider.clone());
 
             let (conversation_string, loaded_conversation) =
                 get_conversation_string(&db, conversation_to_load.clone());
@@ -552,13 +556,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &mut wire,
                 &mut db,
                 user_message,
-                conversation_to_load,
+                conversation_to_load.clone(),
                 loaded_conversation,
                 api,
             )
             .await;
-
-            return Ok(());
         }
         false => {}
     }
