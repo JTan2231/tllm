@@ -3,7 +3,7 @@ use std::fs;
 use std::process::Command;
 
 use chamber_common::{get_config_dir, get_local_dir, get_root_dir};
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, CommandFactory, Parser};
 use tempfile::{Builder, TempPath};
 
 mod sql;
@@ -241,7 +241,7 @@ struct Cli {
     load_last_conversation: Option<bool>,
 
     /// Send a message using the system editor
-    #[arg(short = 'e', action = ArgAction::SetTrue)]
+    #[arg(short = 'e', long, action = ArgAction::SetTrue)]
     editor: Option<bool>,
 
     /// Choose which LLM provider to use (anthropic or openai)
@@ -253,13 +253,14 @@ struct Cli {
     #[arg(short = 'o', long, action = ArgAction::SetTrue)]
     open: Option<bool>,
 
-    /// Open the system editor for writing after last response
-    /// Useful for continuing a conversation without having to reissue commands
+    /// Open the system editor for writing after last response.
+    /// Useful for continuing a conversation without having to reissue commands.
     /// NOTE: This doesn't do anything if the editor isn't selected
     #[arg(short = 'r', long, action = ArgAction::SetTrue)]
     respond: Option<bool>,
 }
 
+#[derive(Debug)]
 struct Options {
     /// Message to send to the LLM
     message: Option<String>,
@@ -373,7 +374,9 @@ fn merge_with_config(mut cli: Cli, config_path: &std::path::PathBuf) -> Cli {
             list,
             load_last_conversation,
             editor,
-            system_prompt
+            system_prompt,
+            open,
+            respond
         );
     }
 
@@ -678,8 +681,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = get_options();
 
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() == 1 && !get_config_dir().join("config").exists() {
+        Cli::command().print_help().unwrap();
+        std::process::exit(1);
+    }
+
     let system_prompt = match cli.system_prompt {
-        Some(f) => match std::fs::read_to_string(f) {
+        Some(ref f) => match std::fs::read_to_string(f) {
             Ok(c) => c,
             Err(_) => String::new(),
         },
@@ -745,7 +754,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         false => {}
     }
 
-    if let Some(message) = cli.message {
+    if let Some(ref message) = cli.message {
         let api = provider_to_api(cli.provider.clone());
 
         let (_, loaded_conversation) = get_conversation_string(&db, conversation_to_load.clone());
@@ -757,10 +766,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if path.is_ok() {
                 match std::fs::read_to_string(path.unwrap()) {
                     Ok(c) => c,
-                    Err(_) => message,
+                    Err(_) => message.to_string(),
                 }
             } else {
-                message
+                message.to_string()
             }
         };
 
