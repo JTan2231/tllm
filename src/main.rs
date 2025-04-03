@@ -258,6 +258,11 @@ struct Cli {
     /// NOTE: This doesn't do anything if the editor isn't selected
     #[arg(short = 'r', long, action = ArgAction::SetTrue)]
     respond: Option<bool>,
+
+    /// Path to a file for dumping the contents of all conversations
+    /// All other flags are ignored if this is set with a valid filepath
+    #[arg(short = 'X', long)]
+    export_all: Option<String>,
 }
 
 #[derive(Debug)]
@@ -286,6 +291,9 @@ struct Options {
     /// Useful for continuing a conversation without having to reissue commands
     /// NOTE: This doesn't do anything if the editor isn't selected
     respond: bool,
+
+    /// Path to a file for dumping the contents of all conversations
+    export_all: Option<String>,
 }
 
 trait ConfigParse {
@@ -397,6 +405,8 @@ fn cli_to_options(cli: Cli) -> Options {
 
         open: cli.open.unwrap_or(false),
         respond: cli.respond.unwrap_or(false),
+
+        export_all: cli.export_all,
     }
 }
 
@@ -686,6 +696,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cli::command().print_help().unwrap();
         std::process::exit(1);
     }
+
+    match cli.export_all {
+        Some(f) => {
+            let mut full_conv_string = String::new();
+
+            let conversations = db.get_conversations()?;
+            for conv in conversations {
+                let (conv_string, _) = get_conversation_string(&db, Some(conv.title.clone()));
+
+                full_conv_string.push_str(&format!(
+                    "{} {} {} \n\n\n {} \n\n\n",
+                    MESSAGE_SEPARATOR, conv.title, MESSAGE_SEPARATOR, conv_string
+                ));
+            }
+
+            std::fs::write(f.clone(), &full_conv_string)?;
+            println!("Chat history exported to {}", f);
+
+            return Ok(());
+        }
+        None => {}
+    };
 
     let system_prompt = match cli.system_prompt {
         Some(ref f) => match std::fs::read_to_string(f) {
