@@ -225,7 +225,7 @@ checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 [[package]]
 name = "chamber-common"
 version = "0.1.0"
-source = "git+https://github.com/JTan2231/chamber.git#6a9363ed732e7d1af745c9eac8129ac1fd9435f6"
+source = "git+https://github.com/JTan2231/chamber-common.git#717bad389a5c580c3e06c02de79b69ce4cd4c30a"
 dependencies = [
  "chrono",
 ]

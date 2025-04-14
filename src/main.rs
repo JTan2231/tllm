@@ -660,7 +660,7 @@ fn conversation_picker(db: &sql::Database) -> Option<String> {
 fn get_options() -> Options {
     let mut cli = Cli::parse();
 
-    if let Some(_) = cli.no_config {
+    if let None = cli.no_config {
         cli = merge_with_config(cli, &get_config_dir().join("config"));
     }
 
