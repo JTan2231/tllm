@@ -263,37 +263,32 @@ struct Cli {
     /// All other flags are ignored if this is set with a valid filepath
     #[arg(short = 'X', long)]
     export_all: Option<String>,
+
+    /// Path to a sqlite database the user would like to use instead of the default
+    #[arg(short = 'd', long)]
+    database: Option<String>,
+
+    /// Ignore whatever config file set in ~/.config/tllm/
+    #[arg(short = 'x', long)]
+    no_config: Option<bool>,
 }
 
 #[derive(Debug)]
 struct Options {
-    /// Message to send to the LLM
     message: Option<String>,
-
-    /// System prompt
     system_prompt: Option<String>,
 
-    /// List saved conversations
     list: bool,
-
     load_last_conversation: bool,
-
-    /// Send a message using the system editor
     editor: bool,
 
-    /// Choose which LLM provider to use (anthropic or openai)
     provider: Option<Provider>,
 
-    /// Open the current conversation in the system editor
     open: bool,
-
-    /// Open the system editor for writing after last response
-    /// Useful for continuing a conversation without having to reissue commands
-    /// NOTE: This doesn't do anything if the editor isn't selected
     respond: bool,
 
-    /// Path to a file for dumping the contents of all conversations
     export_all: Option<String>,
+    database: Option<String>,
 }
 
 trait ConfigParse {
@@ -407,6 +402,7 @@ fn cli_to_options(cli: Cli) -> Options {
         respond: cli.respond.unwrap_or(false),
 
         export_all: cli.export_all,
+        database: cli.database,
     }
 }
 
@@ -662,8 +658,11 @@ fn conversation_picker(db: &sql::Database) -> Option<String> {
 
 /// Parses the CLI and conslidates that with the user-defined config defaults
 fn get_options() -> Options {
-    let cli = Cli::parse();
-    let cli = merge_with_config(cli, &get_config_dir().join("config"));
+    let mut cli = Cli::parse();
+
+    if let Some(_) = cli.no_config {
+        cli = merge_with_config(cli, &get_config_dir().join("config"));
+    }
 
     cli_to_options(cli)
 }
@@ -683,12 +682,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     setup();
     let mut wire = wire::Wire::new(None, None, None).await.unwrap();
 
-    // TODO: Fallback for when the db can't be setup
-    let mut db = match Database::new(&chamber_common::get_local_dir().join("tllm.sqlite")) {
-        Ok(db) => db,
-        Err(_) => panic!("Error setting up DB!"),
-    };
-
     let cli = get_options();
 
     let args: Vec<String> = std::env::args().collect();
@@ -696,6 +689,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cli::command().print_help().unwrap();
         std::process::exit(1);
     }
+
+    let db_path = if let Some(db) = cli.database {
+        std::path::PathBuf::from(db)
+    } else {
+        chamber_common::get_local_dir().join("tllm.sqlite")
+    };
+
+    // TODO: Fallback for when the db can't be setup
+    let mut db = match Database::new(&db_path) {
+        Ok(db) => db,
+        Err(e) => panic!("Error setting up DB! {}", e),
+    };
 
     match cli.export_all {
         Some(f) => {

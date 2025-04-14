@@ -75,6 +75,32 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Create FTS virtual table for messages
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    content,  -- the text field we want to search
+    role,     -- optional: include if you want to search by role too
+    content='messages',  -- this tells FTS which table to shadow
+    content_rowid='message_id'  -- this specifies the primary key to link with
+);
+
+-- Create triggers to keep FTS table in sync with messages table
+CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts(rowid, content, role)
+    VALUES (new.message_id, new.content, new.role);
+END;
+
+CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content, role)
+    VALUES('delete', old.message_id, old.content, old.role);
+END;
+
+CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content, role)
+    VALUES('delete', old.message_id, old.content, old.role);
+    INSERT INTO messages_fts(rowid, content, role)
+    VALUES (new.message_id, new.content, new.role);
+END;
+
 -- Create conversation table
 CREATE TABLE IF NOT EXISTS conversation (
     conversation_id INTEGER PRIMARY KEY AUTOINCREMENT,
