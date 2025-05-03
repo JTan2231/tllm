@@ -271,6 +271,10 @@ struct Cli {
     /// Ignore whatever config file set in ~/.config/tllm/
     #[arg(short = 'x', long)]
     no_config: Option<bool>,
+
+    /// Stream output to stdout
+    #[arg(short = 'S', long)]
+    stream: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -289,6 +293,8 @@ struct Options {
 
     export_all: Option<String>,
     database: Option<String>,
+
+    stream: bool,
 }
 
 trait ConfigParse {
@@ -403,6 +409,8 @@ fn cli_to_options(cli: Cli) -> Options {
 
         export_all: cli.export_all,
         database: cli.database,
+
+        stream: cli.stream.unwrap_or(false),
     }
 }
 
@@ -448,6 +456,7 @@ async fn send_and_save_message(
     conversation_to_load: Option<String>,
     loaded_conversation: Vec<sql::Message>,
     api: wire::types::API,
+    stream: bool,
 ) -> String {
     let messages = {
         let mut new_messages: Vec<wire::types::Message> = loaded_conversation
@@ -473,10 +482,27 @@ async fn send_and_save_message(
         new_messages
     };
 
-    let response = match wire.prompt(api, "", &messages).await {
-        Ok(r) => r,
-        Err(e) => {
-            panic!("Error receiving response: {}", e);
+    let response = if stream {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle =
+            std::thread::spawn(move || wire::prompt_stream(api, "", &messages, tx).unwrap());
+
+        loop {
+            match rx.recv() {
+                Ok(d) => print!("{}", d),
+                Err(_) => break,
+            }
+        }
+
+        println!("");
+
+        handle.join().unwrap()
+    } else {
+        match wire.prompt(api, "", &messages).await {
+            Ok(r) => r,
+            Err(e) => {
+                panic!("Error receiving response: {}", e);
+            }
         }
     };
 
@@ -538,6 +564,10 @@ async fn send_and_save_message(
         }
     };
 
+    if stream {
+        println!("\n---\n");
+    }
+
     if loaded_conversation.len() > 0 {
         println!("Updated conversation {}", conversation_name);
     } else {
@@ -545,8 +575,11 @@ async fn send_and_save_message(
     }
 
     println!("---");
-    println!("{}", response.content);
-    println!("---");
+
+    if !stream {
+        println!("{}", response.content);
+        println!("---");
+    }
 
     conversation_name
 }
@@ -782,6 +815,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     conversation_to_load.clone(),
                     loaded_conversation,
                     api,
+                    cli.stream,
                 )
                 .await;
             } else {
@@ -818,6 +852,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             conversation_to_load.clone(),
             loaded_conversation,
             api,
+            cli.stream,
         )
         .await;
     }
@@ -851,6 +886,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(current_conversation),
                 loaded_conversation,
                 api,
+                cli.stream,
             )
             .await;
         }
