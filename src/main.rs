@@ -273,7 +273,7 @@ struct Cli {
     no_config: Option<bool>,
 
     /// Stream output to stdout
-    #[arg(short = 'S', long)]
+    #[arg(short = 'S', long, action = ArgAction::SetTrue)]
     stream: Option<bool>,
 }
 
@@ -385,7 +385,8 @@ fn merge_with_config(mut cli: Cli, config_path: &std::path::PathBuf) -> Cli {
             editor,
             system_prompt,
             open,
-            respond
+            respond,
+            stream
         );
     }
 
