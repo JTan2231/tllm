@@ -1,134 +1,118 @@
-# tllm - Terminal LLM
-
-A command-line interface for interacting with Large Language Models (LLMs) like Anthropic's Claude and OpenAI's GPT. `tllm` allows you to have conversations directly from your terminal, manage conversation history, and customize your interactions.
-
-## Features
-
-* **Simple Command-Line Interface:** Easy to use with intuitive commands and options.
-* **Provider Selection:** Choose between Anthropic and OpenAI as your LLM provider. Defaults to OpenAI's `GPT4o`.
-* **Conversation History:** Saves and manages your conversations in a local SQLite database.
-* **Load Previous Conversations:** List and load past conversations to continue where you left off.
-* **System Prompts:** Define system-level instructions to guide the LLM's responses.
-* **Editor Integration:** Compose messages and review conversations using your preferred system editor (e.g., Vim, Nano).
-* **Configuration File:** Customize default settings through a configuration file.
-* **File Input:** Provide the content of a file as your message to the LLM.
-* **Continue Conversations:** Easily continue the last conversation or a loaded one.
-* **Read-Only Conversation View:** Open past conversations in your editor for review without modification.
-
-## Installation
-
-This doesn't require anything special beyond a `cargo build --release`. The binary should then be good to use.
-
-## Configuration
-
-`tllm` can be configured via a configuration file located at `~/.local/tllm/config/config`. If the directory or file does not exist, `tllm` will create them on first run.
-
-The configuration file uses a simple `key=value` format, with `#` for comments. The following options can be configured:
-
-* `provider`: The default LLM provider to use (`anthropic` or `openai`). Defaults to `openai`.
-* `list`: Default behavior for listing conversations (`true` or `false`). Defaults to `false`.
-* `load_last_conversation`: Default behavior for loading the last conversation (`true` or `false`). Defaults to `false`.
-* `editor`: Default behavior for using the system editor for messages (`true` or `false`). Defaults to `false`.
-* `system_prompt`: Default path to a file containing the system prompt.
-
-**Example `~/.local/tllm/config/config`:**
-
-```ini
-# Set the default provider to anthropic
-provider=anthropic
-
-# Always use the editor by default
-editor=true
-
-# Specify a default system prompt file
-system_prompt=~/.config/tllm/default_system_prompt.txt
-```
-
-**Note:** Command-line arguments will always override the settings in the configuration file.
-
 ## Usage
 
-```
+```bash
 tllm [OPTIONS] [MESSAGE]
 ```
 
 ### Arguments
 
-* `[MESSAGE]`: The message to send to the LLM. If this is a path to a file, the content of the file will be used as the message.
+**[MESSAGE]** (Optional): The message/prompt to send to the LLM. If the message looks like a valid file path, the tool will attempt to read the file's content and use that as the message.
 
 ### Options
 
-* `-s, --system-prompt <PATH>`: Path to a file containing your system prompt. This will be ignored if the path is invalid.
-* `-l, --list`: List saved conversations. This will open your editor with a list of conversations and allow you to select one to load using the `load` operation.
-* `-L, --load-last-conversation`: Load the last updated conversation.
-* `-e`: Send a message using the system editor. This will open your editor, optionally pre-filled with the history of the current conversation.
-* `-p, --provider <PROVIDER>`: Choose which LLM provider to use (`anthropic` or `openai`).
-* `-o, --open`: Open the current conversation in the system editor in read-only mode. If no conversation is active, it will prompt you to select one.
-* `-r, --respond`: Open the system editor for writing after the last response. Useful for continuing a conversation without having to reissue commands. This only works if the `-e` option is also used.
-* `-h, --help`: Print help information.
-* `-V, --version`: Print version information.
+- `-s, --system-prompt <FILE_PATH>`: Path to a file containing the system prompt. Ignored if the path is invalid.
+- `-l, --list`: List saved conversations and enter an interactive editor mode to select one to load. Conflicts with `-L`.
+- `-L, --load-last-conversation`: Load the most recently updated conversation. Conflicts with `-l`.
+- `-e, --editor`: Open the system editor (`$EDITOR`) to compose the message. Shows conversation history if loading a conversation.
+- `-p, --provider <PROVIDER>`: Choose the LLM provider. Valid options: `anthropic`, `openai`. Defaults to openai (specifically GPT-4) if not set via config or CLI.
+- `-o, --open`: Open the current or a selected conversation in the system editor (read-only). If no conversation is active/loaded, prompts to select one.
+- `-r, --respond`: After receiving a response when using the editor (`-e`), immediately reopen the editor to compose the next message in the same conversation. Does nothing if `-e` is not used.
+- `-X, --export-all <FILE_PATH>`: Export the entire conversation history from the database to the specified file. All other flags are ignored if this is set.
+- `-d, --database <DB_PATH>`: Use a specific SQLite database file instead of the default (`~/.local/tllm/tllm.sqlite` or `~/.local/tllm-dev/tllm.sqlite` for debug builds).
+- `-x, --no-config`: Ignore the configuration file (`~/.config/tllm/config`).
+- `-S, --stream`: Stream the LLM response to standard output as it arrives.
+- `-h, --help`: Print help information.
+- `-V, --version`: Print version information.
+
+### Configuration
+
+You can set default options by creating a configuration file at `~/.config/tllm/config`. The tool will create the necessary directories (`~/.local/tllm` and `~/.config/tllm`) on first run if they don't exist.
+
+The configuration file uses a simple key=value format. Lines starting with `#` are ignored.
+
+#### Supported Configuration Keys:
+
+- `provider`: `anthropic` or `openai`
+- `list`: `true` or `false`
+- `load_last_conversation`: `true` or `false`
+- `editor`: `true` or `false`
+- `system_prompt`: Path to the system prompt file
+- `open`: `true` or `false`
+- `respond`: `true` or `false`
+- `stream`: `true` or `false`
+
+#### Example `~/.config/tllm/config`:
+
+```ini
+# Default LLM provider
+provider=openai
+
+# Always use the editor by default
+editor=true
+
+# Default system prompt file
+system_prompt=/home/user/prompts/default_system.txt
+
+# Automatically stream responses
+stream=true
+```
+
+**Precedence**: Command-line arguments always override settings in the configuration file. The `--no-config` flag prevents the configuration file from being loaded at all.
+
+### Database
+
+Conversations are stored in a SQLite database located by default at:
+
+- Release Build: `~/.local/tllm/tllm.sqlite`
+- Debug Build: `~/.local/tllm-dev/tllm.sqlite`
+
+You can specify a different database location using the `-d` or `--database` option.
+
+### Logs
+
+Log files are stored in:
+
+- Release Build: `~/.local/tllm/logs/`
+- Debug Build: `~/.local/tllm-dev/logs/`
+
+Log file names are timestamps in microseconds since the UNIX epoch (e.g., `1678886400123456.log`) for release builds, or `debug.log` for debug builds.
 
 ### Examples
 
-1.  **Send a simple message:**
-    ```bash
-    tllm "What is the capital of France?"
-    ```
+Send a simple message:
+```bash
+tllm "What is the capital of France?"
+```
 
-2.  **Send a message with a system prompt:**
-    ```bash
-    tllm -s system_prompt.txt "Explain this concept as if I were a five-year-old."
-    ```
-    where `system_prompt.txt` contains:
-    ```
-    You are a helpful assistant that explains complex topics in simple terms.
-    ```
+Send a message using the editor:
+```bash
+tllm -e
+```
+(Your `$EDITOR` will open. Type your message, save, and close.)
 
-3.  **List and load a conversation:**
-    ```bash
-    tllm -l
-    ```
-    This will open your editor. Modify the lines to change `nothing` to `load` for the conversation you want to continue, then save and close the editor.
+Start a new conversation with a system prompt and stream the response:
+```bash
+tllm -s ~/prompts/coder.txt -S "Write a python function for fibonacci"
+```
 
-4.  **Load the last conversation:**
-    ```bash
-    tllm -L
-    ```
+List conversations and load one:
+```bash
+tllm -l
+```
+(Editor opens with a list. Change nothing to load for the desired conversation, save, and close.)
 
-5.  **Send a message using the editor:**
-    ```bash
-    tllm -e
-    ```
-    This will open your editor. Type your message, save, and close the editor to send it.
+Load the last conversation and continue it using the editor, reopening the editor after each response:
+```bash
+tllm -L -e -r
+```
 
-6.  **Specify the provider:**
-    ```bash
-    tllm -p anthropic "How does Claude compare to other LLMs?"
-    ```
+Export all conversations:
+```bash
+tllm -X ~/tllm_backup.txt
+```
 
-7.  **Open the current conversation in read-only mode:**
-    ```bash
-    tllm -o
-    ```
+### Development Notes
 
-8.  **Start a conversation with the editor and continue responding:**
-    ```bash
-    tllm -e -r "Hello, let's start a new conversation."
-    ```
-    After the initial response, your editor will reopen for your next message. This will continue until you submit an empty message.
-
-9.  **Send the content of a file as a message:**
-    ```bash
-    tllm path/to/my/document.txt
-    ```
-
-## Important Notes
-
-* **API Keys:** This README does not cover the handling of API keys for Anthropic and OpenAI. You will likely need to configure these separately, possibly through environment variables or another configuration mechanism not shown in this code snippet. Refer to the documentation of the `wire` crate used in the code for details on API key management.
-* **Error Handling:** The provided code includes a `TODO` comment about improving error handling, particularly around `unwrap()` calls. In a production-ready application, these should be handled more gracefully.
-* **Logging:** The application sets up basic logging to a file in `~/.local/tllm/logs/`.
-* **Database Location:** Conversation history is stored in an SQLite database at `~/.local/tllm/tllm.sqlite`.
-
-## License
-
-MIT
+- The code contains several `.unwrap()` calls that should ideally be replaced with more robust error handling (e.g., using `Result` and `?`).
+- API key management relies on the external `wire` crate. Ensure it's configured correctly.
+- The default configuration path (`~/.local/tllm/config/`) is noted as potentially incorrect in a code comment.
