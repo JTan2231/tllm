@@ -111,11 +111,6 @@ Export all conversations:
 tllm -X ~/tllm_backup.txt
 ```
 
-Use the Anthropic provider with a custom database:
-```bash
-tllm -p anthropic -d /mnt/data/my_tllm.sqlite "Tell me about Claude Sonnet 3.5"
-```
-
 ### Development Notes
 
 - The code contains several `.unwrap()` calls that should ideally be replaced with more robust error handling (e.g., using `Result` and `?`).
