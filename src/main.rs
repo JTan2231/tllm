@@ -714,7 +714,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // TODO: A lot of panics around here that need taken care of
 
     setup();
-    let mut wire = wire::Wire::new(None, None, None).await.unwrap();
+    let mut wire = wire::Wire::new(None).await.unwrap();
 
     let cli = get_options();
 
