@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-wire = { git = "https://github.com/JTan2231/wire.git" }
+# wire = { git = "https://github.com/JTan2231/wire.git" }
+wire = { path = "/Users/joey/rust/wire" }
 chamber-common = { git = "https://github.com/JTan2231/chamber-common.git" }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4.3", features = ["derive"] }

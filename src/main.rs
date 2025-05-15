@@ -22,16 +22,19 @@ fn create_if_nonexistent(path: &std::path::PathBuf) {
     }
 }
 
-// Normally this would return an error
-// but if this fails then the app can't run correctly
-//
 // TODO: the config shouldn't be in `~/.local/tllm/config/`
-fn setup() {
+fn setup(transient: bool) {
     // TODO: better path config handling
     let home_dir = match std::env::var("HOME") {
         Ok(d) => d,
         Err(e) => {
-            panic!("Error getting home variable: {}", e);
+            let message = format!("Error getting home variable: {}", e);
+            if transient {
+                println!("{}", message);
+                "/tmp".to_string()
+            } else {
+                panic!("{}", message);
+            }
         }
     };
 
@@ -43,30 +46,11 @@ fn setup() {
 
     chamber_common::Workspace::new(&root);
 
-    create_if_nonexistent(&get_local_dir());
-    create_if_nonexistent(&get_root_dir().join("logs"));
-    create_if_nonexistent(&get_config_dir());
-
-    let log_name = if cfg!(debug_assertions) {
-        "debug".to_string()
-    } else {
-        format!(
-            "{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_micros()
-        )
-    };
-
-    // TODO: proper logging, obviously
-    chamber_common::Logger::init(
-        get_root_dir()
-            .join("logs")
-            .join(format!("{}.log", log_name))
-            .to_str()
-            .unwrap(),
-    );
+    if !transient {
+        create_if_nonexistent(&get_local_dir());
+        create_if_nonexistent(&get_root_dir().join("logs"));
+        create_if_nonexistent(&get_config_dir());
+    }
 }
 
 enum Shell {
@@ -237,6 +221,9 @@ struct Cli {
     #[arg(short = 'l', long, conflicts_with = "load_last_conversation", action = ArgAction::SetTrue)]
     list: Option<bool>,
 
+    #[arg(short = 't', long, action = ArgAction::SetTrue)]
+    transient: Option<bool>,
+
     #[arg(short = 'L', long, conflicts_with = "list", action = ArgAction::SetTrue)]
     load_last_conversation: Option<bool>,
 
@@ -244,7 +231,7 @@ struct Cli {
     #[arg(short = 'e', long, action = ArgAction::SetTrue)]
     editor: Option<bool>,
 
-    /// Choose which LLM provider to use (anthropic or openai)
+    /// Choose which LLM provider to use (anthropic, openai, or gemini)
     #[arg(short = 'p', long)]
     #[arg(value_parser = parse_provider)]
     provider: Option<Provider>,
@@ -305,9 +292,11 @@ trait ConfigParse {
 
 impl ConfigParse for Provider {
     fn parse_config(value: &str) -> Option<Self> {
+        println!("provider value: {}", value);
         match value.to_lowercase().as_str() {
             "anthropic" => Some(Provider::Anthropic),
             "openai" => Some(Provider::OpenAI),
+            "google" => Some(Provider::Google),
             _ => None,
         }
     }
@@ -419,12 +408,14 @@ fn cli_to_options(cli: Cli) -> Options {
 enum Provider {
     Anthropic,
     OpenAI,
+    Google,
 }
 
 fn parse_provider(s: &str) -> Result<Provider, String> {
     match s.to_lowercase().as_str() {
         "anthropic" => Ok(Provider::Anthropic),
         "openai" => Ok(Provider::OpenAI),
+        "google" => Ok(Provider::Google),
         _ => Err(format!(
             "Invalid provider: {}. Must be 'anthropic' or 'openai'",
             s
@@ -440,8 +431,10 @@ fn provider_to_api(provider: Option<Provider>) -> wire::types::API {
                 wire::types::API::Anthropic(wire::types::AnthropicModel::Claude35Sonnet)
             }
             Provider::OpenAI => wire::types::API::OpenAI(wire::types::OpenAIModel::GPT4o),
+            Provider::Google => wire::types::API::Gemini(wire::types::GeminiModel::Gemini25ProExp),
         }
     } else {
+        println!("Defaulting provider to OpenAI's GPT4o");
         wire::types::API::OpenAI(wire::types::OpenAIModel::GPT4o)
     }
 }
@@ -713,7 +706,11 @@ const MESSAGE_SEPARATOR: &str = "========";
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // TODO: A lot of panics around here that need taken care of
 
-    setup();
+    {
+        let cli = Cli::parse();
+        setup(cli.transient.unwrap_or(false));
+    }
+
     let mut wire = wire::Wire::new(None).await.unwrap();
 
     let cli = get_options();
