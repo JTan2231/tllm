@@ -478,8 +478,10 @@ async fn send_and_save_message(
 
     let response = if stream {
         let (tx, rx) = std::sync::mpsc::channel();
-        let handle =
-            std::thread::spawn(move || wire::prompt_stream(api, "", &messages, tx).unwrap());
+        let sys_prompt = system_prompt.to_string();
+        let handle = std::thread::spawn(move || {
+            wire::prompt_stream(api, &sys_prompt, &messages, tx).unwrap()
+        });
 
         loop {
             match rx.recv() {
