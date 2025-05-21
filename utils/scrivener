@@ -1,0 +1,41 @@
+#!/bin/bash
+
+# Initialize variable for staged flag
+staged=false
+
+# Parse command line arguments
+while getopts "s" opt; do
+  case $opt in
+    s)
+      staged=true
+      ;;
+    \?)
+      echo "Invalid option: -$OPTARG" >&2
+      exit 1
+      ;;
+  esac
+done
+
+# Capture git diff output based on staged flag
+if [ "$staged" = true ]; then
+    diff_content=$(git diff --staged)
+else
+    diff_content=$(git diff)
+fi
+
+# Check if diff is empty
+if [ -z "$diff_content" ]; then
+    if [ "$staged" = true ]; then
+        echo "No staged differences found in git diff"
+    else
+        echo "No differences found in git diff"
+    fi
+    exit 0
+fi
+
+# Create the prompt
+prompt="Summarize this git diff:
+
+$diff_content"
+
+tllm -x true -p google "$prompt"

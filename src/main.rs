@@ -221,9 +221,11 @@ struct Cli {
     #[arg(short = 'l', long, conflicts_with = "load_last_conversation", action = ArgAction::SetTrue)]
     list: Option<bool>,
 
+    /// Don't save anything to the db--for one-off exchanges
     #[arg(short = 't', long, action = ArgAction::SetTrue)]
     transient: Option<bool>,
 
+    /// Load the last updated conversation in the DB
     #[arg(short = 'L', long, conflicts_with = "list", action = ArgAction::SetTrue)]
     load_last_conversation: Option<bool>,
 
